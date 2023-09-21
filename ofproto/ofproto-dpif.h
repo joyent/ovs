@@ -55,6 +55,7 @@
 #include "ofproto-provider.h"
 #include "util.h"
 #include "ovs-thread.h"
+#include "maglev_hash.h"
 
 struct dpif_flow_stats;
 struct ofproto_async_msg;
@@ -142,6 +143,7 @@ struct group_dpif {
     uint32_t hash_basis;                /* Basis for dp_hash. */
     uint32_t hash_mask;                 /* Used to mask dp_hash (2^N - 1).*/
     struct ofputil_bucket **hash_map;   /* Map hash values to buckets. */
+    struct maglev_hash_service* mh_svc;	/* Maglev Hash, joyent */
 };
 
 void group_dpif_credit_stats(struct group_dpif *,

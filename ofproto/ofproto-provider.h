@@ -1868,7 +1868,8 @@ struct ofproto_class {
     void (*group_destruct)(struct ofgroup *);
     void (*group_dealloc)(struct ofgroup *);
 
-    void (*group_modify)(struct ofgroup *);
+    /* joyent */
+    void (*group_modify)(struct ofgroup *new_group, struct ofgroup *old_group);
 
     enum ofperr (*group_get_stats)(const struct ofgroup *,
                                    struct ofputil_group_stats *);

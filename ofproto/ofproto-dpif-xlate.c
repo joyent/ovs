@@ -4607,6 +4607,49 @@ pick_default_select_group(struct xlate_ctx *ctx, struct group_dpif *group)
                                   flow_hash_symmetric_l4(&ctx->xin->flow, 0));
 }
 
+/* joyent */
+static struct ofputil_bucket *
+pick_maglev_select_group(struct xlate_ctx *ctx, struct group_dpif *group)
+{
+    uint32_t hash;
+    const struct field_array *fields = &group->up.props.fields;
+    const uint8_t *mask_values = fields->values;
+
+    hash = hash_uint64(group->up.props.selection_method_param);
+
+    size_t i;
+    BITMAP_FOR_EACH_1 (i, MFF_N_IDS, fields->used.bm) {
+        const struct mf_field *mf = mf_from_id(i);
+
+        /* Skip fields for which prerequisites are not met. */
+        if (!mf_are_prereqs_ok(mf, &ctx->xin->flow, ctx->wc)) {
+            /* Skip the mask bytes for this field. */
+            mask_values += mf->n_bytes;
+            continue;
+        }
+
+        union mf_value value;
+        union mf_value mask;
+
+        mf_get_value(mf, &ctx->xin->flow, &value);
+        /* Mask the value. */
+        for (int j = 0; j < mf->n_bytes; j++) {
+            mask.b[j] = *mask_values++;
+            value.b[j] &= mask.b[j];
+        }
+        hash = hash_bytes(&value, mf->n_bytes, hash);
+
+        /* For tunnels, hash in whether the field is present. */
+        if (mf_is_tun_metadata(mf)) {
+            hash = hash_boolean(mf_is_set(mf, &ctx->xin->flow), hash);
+        }
+
+        mf_mask_field_masked(mf, &mask, ctx->wc);
+    }
+
+    return mh_lookup(group, hash);
+}
+
 static struct ofputil_bucket *
 pick_hash_fields_select_group(struct xlate_ctx *ctx, struct group_dpif *group)
 {
@@ -4700,8 +4743,22 @@ pick_select_group(struct xlate_ctx *ctx, struct group_dpif *group)
     case SEL_METHOD_DEFAULT:
         return pick_default_select_group(ctx, group);
         break;
-    case SEL_METHOD_HASH:
-        return pick_hash_fields_select_group(ctx, group);
+    case SEL_METHOD_HASH: 
+        {
+            struct ofputil_bucket *bucket;
+            if (0) {
+                bucket = pick_hash_fields_select_group(ctx, group);
+            }
+            else {
+                /* joyent */
+                bucket = pick_maglev_select_group(ctx, group);
+                if (bucket != NULL) {
+                    VLOG_INFO("MH: selected bucket by Maglev Hash: id=%u", bucket->bucket_id);
+                }
+            }
+
+            return bucket;
+        }
         break;
     case SEL_METHOD_DP_HASH:
         return pick_dp_hash_select_group(ctx, group);

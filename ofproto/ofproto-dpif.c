@@ -5169,6 +5169,24 @@ group_set_selection_method(struct group_dpif *group)
     }
 }
 
+/* joyent */
+static void group_modify(struct ofgroup *new_group_, struct ofgroup *old_group_)
+{
+    struct group_dpif *new_group = group_dpif_cast(new_group_);
+    struct group_dpif *old_group = group_dpif_cast(old_group_);
+
+    ovs_mutex_lock(&new_group->stats_mutex);
+
+    if (new_group->up.type == OFPGT11_SELECT && 
+        new_group->selection_method == SEL_METHOD_HASH) {
+
+        VLOG_INFO("Construct Group: group=%d(%p)", new_group->up.group_id, new_group);
+        mh_construct(new_group, old_group);
+    }
+
+    ovs_mutex_unlock(&new_group->stats_mutex);
+}
+
 static enum ofperr
 group_construct(struct ofgroup *group_)
 {
@@ -5181,6 +5199,10 @@ group_construct(struct ofgroup *group_)
     if (group->up.type == OFPGT11_SELECT) {
         group_set_selection_method(group);
     }
+
+    /* joyent */
+    group->mh_svc = NULL;
+
     ovs_mutex_unlock(&group->stats_mutex);
     return 0;
 }
@@ -5193,6 +5215,12 @@ group_destruct(struct ofgroup *group_)
     if (group->hash_map) {
         free(group->hash_map);
         group->hash_map = NULL;
+    }
+
+    /* joyent */
+    if (group->mh_svc) {
+        VLOG_INFO("Destruct Group: group=%d(%p)", group->up.group_id, group);
+        mh_destruct(group);
     }
 }
 
@@ -6720,7 +6748,7 @@ const struct ofproto_class ofproto_dpif_class = {
     group_construct,            /* group_construct */
     group_destruct,             /* group_destruct */
     group_dealloc,              /* group_dealloc */
-    NULL,                       /* group_modify */
+    group_modify,               /* group_modify */
     group_get_stats,            /* group_get_stats */
     get_datapath_version,       /* get_datapath_version */
     get_datapath_cap,
