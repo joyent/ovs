@@ -4,8 +4,9 @@
 #include "ovs-atomic.h"
 #include "openvswitch/list.h"
 
-#define MH_FLAG_FALLBACK    0x0001
+#define MH_FLAG_FALLBACK     0x0001
 #define MH_DEST_FLAG_DISABLE 0x0001
+#define MH_DEST_FLAG_DIRTY	 0x0002
 
 struct maglev_dest_setup {
     uint32_t    offset; /* starting offset */
@@ -17,6 +18,7 @@ struct maglev_dest_setup {
 struct maglev_dest {
     struct ovs_list     n_list;         /* for the dests in the service */
     struct atomic_count version;        /* version number */
+    uint32_t            gid;            /* group id */
     uint32_t            dest_id;        /* destination ID */
     uint32_t            flags;          /* dest status flags */
     uint32_t            weight;         /* server weight. 0: disable */
@@ -24,8 +26,13 @@ struct maglev_dest {
     void                *data;          /* user data */
 };
 
+struct maglev_dirty_dest {
+    int num_dirty;
+    struct maglev_dest **dirty;
+};
+
 struct maglev_lookup {
-    struct maglev_dest  *dest;  /* real server (cache) */
+    struct maglev_dest  *dest[2];  /* real server (cache), [primary, secondary] */
 };
 
 struct maglev_state {
@@ -53,7 +60,7 @@ struct ofputil_bucket;
 
 void                   mh_construct(struct group_dpif *new_group, struct group_dpif *old_group);
 void                   mh_destruct(struct group_dpif *group);
-struct ofputil_bucket* mh_lookup(struct group_dpif *group, uint32_t hash_data);
+struct ofputil_bucket* mh_lookup(struct group_dpif *group, uint32_t hash_data, uint8_t try_use_secondary);
 
 
 

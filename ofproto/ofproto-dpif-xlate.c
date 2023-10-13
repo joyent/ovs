@@ -4647,7 +4647,32 @@ pick_maglev_select_group(struct xlate_ctx *ctx, struct group_dpif *group)
         mf_mask_field_masked(mf, &mask, ctx->wc);
     }
 
-    return mh_lookup(group, hash);
+    /* for Maglev Ext */
+    uint8_t try_use_secondary = 1;
+    uint16_t tcp_flags = TCP_FLAGS(ctx->xin->flow.tcp_flags);
+
+    if (ctx->xin->flow.nw_proto == IPPROTO_TCP) {
+        /* only a syn packet */
+        if (ctx->xin->packet != NULL && tcp_flags == TCP_SYN) {
+            /* primary */
+            try_use_secondary = 0;
+        } else {
+            /* the other packets or revalidating(means not a syn packet) use secondary */
+        }
+    } else {
+        try_use_secondary = 0;
+    }
+
+    struct flow *flow = &ctx->xin->flow;
+    VLOG_INFO("MH: "IP_FMT":%u->"IP_FMT":%u(%d,0x%x), packet=%p, try_use_secondary=%d", 
+              IP_ARGS(flow->nw_src), ntohs(flow->tp_src),
+              IP_ARGS(flow->nw_dst), ntohs(flow->tp_dst),
+              flow->nw_proto, 
+              tcp_flags, 
+              ctx->xin->packet,
+              try_use_secondary);
+
+    return mh_lookup(group, hash, try_use_secondary);
 }
 
 static struct ofputil_bucket *
@@ -4753,7 +4778,9 @@ pick_select_group(struct xlate_ctx *ctx, struct group_dpif *group)
                 /* joyent */
                 bucket = pick_maglev_select_group(ctx, group);
                 if (bucket != NULL) {
-                    VLOG_INFO("MH: selected bucket by Maglev Hash: id=%u", bucket->bucket_id);
+                    VLOG_INFO("MH: selected bucket by Maglev Hash: id=%u:%u", 
+                              group->up.group_id,
+                              bucket->bucket_id);
                 }
             }
 
