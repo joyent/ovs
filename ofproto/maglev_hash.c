@@ -34,8 +34,7 @@
 
 VLOG_DEFINE_THIS_MODULE(maglev_hash);
 
-#define CONFIG_MH_TAB_INDEX 0 // zero based
-static uint32_t mh_primes[] = {11, 251, 509, 1021, 2039, 4093, 8191, 16381, 32749, 65521, 131071};
+#define CONFIG_MH_TAB_INDEX 5 /* 4093 */
 
 static void mh_reset_state(struct maglev_state *s);
 static int mh_get_dest_count(struct maglev_hash_service *svc);
@@ -50,6 +49,22 @@ static inline uint32_t mh_hash1(uint8_t *data, uint32_t len)
 static inline uint32_t mh_hash2(uint8_t *data, uint32_t len)
 {
     return jhash_bytes(data, len, 0);
+}
+
+static inline uint32_t mh_get_table_size(uint32_t idx) {
+    /* [0]:      for debugging
+     * [1 ~ 10]: valid
+     */
+
+    static uint32_t mh_primes[] = {11, 251, 509, 1021, 2039, 4093, 8191, 16381, 32749, 65521, 131071};
+
+    uint32_t len = sizeof(mh_primes) / sizeof(mh_primes[0]);
+
+    if (idx < 1 || idx > len) {
+        idx = CONFIG_MH_TAB_INDEX;
+    }
+
+    return mh_primes[idx];
 }
 
 /* Helper function to determine if server is unavailable */
@@ -158,9 +173,11 @@ static int mh_populate(struct maglev_state *s, struct maglev_hash_service *svc)
                 s->lookup[c].dest[0] =  new_dest;
                 s->lookup[c].dest[1] =  new_dest;
 
+#if 0
                 dbg_print("new dest(%d): primary=%u:%u:%u:%p", 
                           c, 
                           new_dest->gid, new_dest->dest_id, new_dest->weight, new_dest);
+#endif
             } else if (dest != new_dest) {
                 s->lookup[c].dest[0] =  new_dest;
                 s->lookup[c].dest[1] =  dest;
@@ -221,7 +238,8 @@ static struct maglev_dest* mh_lookup_dest(struct maglev_state *s,  uint32_t hash
 static inline struct maglev_dest *mh_lookup_dest_fallback(struct maglev_state *s, uint32_t hash_data, uint8_t try_use_secondary)
 {
     unsigned int offset, roffset;
-    unsigned int hash, ihash;
+    unsigned int hash;
+    //unsigned int ihash;
     struct maglev_dest *dest;
 
     if (!s) {
@@ -242,6 +260,7 @@ static inline struct maglev_dest *mh_lookup_dest_fallback(struct maglev_state *s
      * starting from ihash to find a new dest
      */
     for (offset = 0; offset < s->lookup_size; offset++) {
+        /* XXX: FIXME from ipvs code */
         roffset = offset + hash_data;
         hash = mh_hash1((uint8_t*)&roffset, sizeof(roffset));
         dest = mh_get_lookup_dest(s, hash, try_use_secondary);
@@ -686,7 +705,7 @@ static int mh_dump_lookup_table(struct maglev_hash_service *svc)
         return 0;
 
     int num_dests = mh_get_dest_count(svc);
-    struct maglev_dest *dest, *secondary;
+    struct maglev_dest *dest;
     int i,j,k;
     struct dump_cnt *dcnt = xcalloc(num_dests, sizeof(struct dump_cnt));
 
@@ -713,12 +732,15 @@ static int mh_dump_lookup_table(struct maglev_hash_service *svc)
             }
         }
 
+#if 0
+        struct maglev_dest *secondary;
         dest = lookup[i].dest[0];
         secondary = lookup[i].dest[1];
         dbg_print("Look(%d): primary=%u:%u:%u:%p, secondary=%u:%u:%u:%p", 
                   i, 
                   dest->gid, dest->dest_id, dest->weight, dest,
                   secondary->gid, secondary->dest_id, secondary->weight, secondary);
+#endif
     }
 
     for (i=0; i<num_dests; i++) {
@@ -740,6 +762,7 @@ static void mh_build(struct group_dpif *group)
 {
     struct maglev_hash_service* mh_svc;
     struct ofputil_bucket *bucket;
+    uint32_t tab_size=0;
 
     if (group->mh_svc) {
         mh_free_service(group->mh_svc);
@@ -747,13 +770,15 @@ static void mh_build(struct group_dpif *group)
 
     group->mh_svc = NULL;
 
-    mh_svc = mh_alloc_service(mh_primes[CONFIG_MH_TAB_INDEX]);
+    tab_size = mh_get_table_size((uint32_t)group->hash_alg);
+    mh_svc = mh_alloc_service(tab_size);
     if (mh_svc == NULL) {
         VLOG_ERR("failed to alloc a new Maglev Hash SVC: group=%d", group->up.group_id);
         return;
     }
 
-    VLOG_INFO("Start building a new Maglev Hash SVC: group=%d, mh_svc=%p", group->up.group_id, mh_svc);
+    VLOG_INFO("Start building a new Maglev Hash SVC: group=%d, mh_svc=%p, table_size=%u(%u)", 
+              group->up.group_id, mh_svc, tab_size, group->hash_alg);
 
     LIST_FOR_EACH (bucket, list_node, &group->up.buckets) {
         mh_add_dest(group->up.group_id, bucket->bucket_id, bucket->weight, bucket, mh_svc);
@@ -780,8 +805,10 @@ static void mh_modify(struct group_dpif *new, struct group_dpif *old)
     uint32_t changed = 0;
     struct maglev_hash_service* mh_svc = old->mh_svc;
 
-    VLOG_INFO("Start modifying the Maglev Hash SVC: group=%d, mh_svc=%p", 
-              new->up.group_id, mh_svc);
+    VLOG_INFO("Start modifying the Maglev Hash SVC: group=%d, mh_svc=%p, table_size=%u(%u)", 
+              new->up.group_id, mh_svc, 
+              mh_get_table_size((uint32_t)new->hash_alg), 
+              (uint32_t)new->hash_alg);
 
     // XXX: use refcnt
     old->mh_svc = NULL;
@@ -877,15 +904,27 @@ static struct ofputil_bucket* mh_get_bucket_by_id(uint32_t id, struct group_dpif
 
 void mh_construct(struct group_dpif *new_group, struct group_dpif *old_group)
 {
-    VLOG_INFO("Construct Maglev Hash: new group=%u(%p), old group=%p", 
-              new_group->up.group_id, 
-              new_group, old_group);
+    VLOG_INFO("Construct Maglev Hash: new group=%u(%p), tab_size_idx=%u, old group=%p", 
+              new_group->up.group_id, new_group, (uint32_t)new_group->hash_alg,
+              old_group);
 
     if (old_group == NULL || old_group->mh_svc == NULL) {
         mh_build(new_group);
     }
     else {
-        mh_modify(new_group, old_group);
+        uint32_t new_tab_size = mh_get_table_size((uint32_t)new_group->hash_alg);
+        uint32_t old_tab_size = mh_get_table_size((uint32_t)old_group->hash_alg);
+
+        if (new_tab_size != old_tab_size) {
+            /* cannot modity the existing table */
+            VLOG_INFO("The exist lookup table cannot be modified because the table sizes are different: group=%d, new_table_size=%u(%u), old_table_size=%u(%u)", new_group->up.group_id, 
+                      new_tab_size, new_group->hash_alg,
+                      old_tab_size, old_group->hash_alg);
+
+            mh_build(new_group);
+        } else {
+            mh_modify(new_group, old_group);
+        }
     }
 }
 

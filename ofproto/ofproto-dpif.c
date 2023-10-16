@@ -5163,6 +5163,21 @@ group_set_selection_method(struct group_dpif *group)
             VLOG_DBG("No hash fields. Falling back to default hash method.");
             group->selection_method = SEL_METHOD_DEFAULT;
         }
+    } else if (!strcmp(selection_method, "maglev")) {
+        VLOG_DBG("Selection method specified: maglev.");
+        if (props->fields.values_size > 0) {
+            /* Controller has specified hash fields. */
+            struct ds s = DS_EMPTY_INITIALIZER;
+            oxm_format_field_array(&s, &props->fields);
+            VLOG_DBG("Hash fields: %s", ds_cstr(&s));
+            ds_destroy(&s);
+            group->selection_method = SEL_METHOD_MAGLEV;
+            group->hash_alg = (uint32_t)props->selection_method_param;
+        } else {
+            /* No hash fields. Fall back to original default hashing. */
+            VLOG_DBG("No hash fields. Falling back to default hash method.");
+            group->selection_method = SEL_METHOD_MAGLEV;
+        }
     } else {
         /* Parsing of groups should ensure this never happens */
         OVS_NOT_REACHED();
@@ -5178,9 +5193,11 @@ static void group_modify(struct ofgroup *new_group_, struct ofgroup *old_group_)
     ovs_mutex_lock(&new_group->stats_mutex);
 
     if (new_group->up.type == OFPGT11_SELECT && 
-        new_group->selection_method == SEL_METHOD_HASH) {
+        new_group->selection_method == SEL_METHOD_MAGLEV) {
 
-        VLOG_INFO("Construct Group: group=%d(%p)", new_group->up.group_id, new_group);
+        VLOG_INFO("Construct Group: group=%d(%p), tab_size_idx=%u", 
+                  new_group->up.group_id, new_group, (uint32_t)new_group->hash_alg);
+
         mh_construct(new_group, old_group);
     }
 

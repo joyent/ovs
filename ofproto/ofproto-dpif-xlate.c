@@ -4611,11 +4611,12 @@ pick_default_select_group(struct xlate_ctx *ctx, struct group_dpif *group)
 static struct ofputil_bucket *
 pick_maglev_select_group(struct xlate_ctx *ctx, struct group_dpif *group)
 {
-    uint32_t hash;
+    uint32_t hash = 0;
     const struct field_array *fields = &group->up.props.fields;
     const uint8_t *mask_values = fields->values;
 
-    hash = hash_uint64(group->up.props.selection_method_param);
+    // bucket size
+    //hash = hash_uint64(group->up.props.selection_method_param);
 
     size_t i;
     BITMAP_FOR_EACH_1 (i, MFF_N_IDS, fields->used.bm) {
@@ -4769,26 +4770,23 @@ pick_select_group(struct xlate_ctx *ctx, struct group_dpif *group)
         return pick_default_select_group(ctx, group);
         break;
     case SEL_METHOD_HASH: 
-        {
-            struct ofputil_bucket *bucket;
-            if (0) {
-                bucket = pick_hash_fields_select_group(ctx, group);
-            }
-            else {
-                /* joyent */
-                bucket = pick_maglev_select_group(ctx, group);
-                if (bucket != NULL) {
-                    VLOG_INFO("MH: selected bucket by Maglev Hash: id=%u:%u", 
-                              group->up.group_id,
-                              bucket->bucket_id);
-                }
-            }
-
-            return bucket;
-        }
+        return pick_hash_fields_select_group(ctx, group);
         break;
     case SEL_METHOD_DP_HASH:
         return pick_dp_hash_select_group(ctx, group);
+        break;
+    /* joyent */
+    case SEL_METHOD_MAGLEV: 
+        {
+            struct ofputil_bucket *bucket;
+            bucket = pick_maglev_select_group(ctx, group);
+            if (bucket != NULL) {
+                VLOG_INFO("MH: selected bucket by Maglev Hash: id=%u:%u", 
+                          group->up.group_id,
+                          bucket->bucket_id);
+            }
+            return bucket;
+        }
         break;
     default:
         /* Parsing of groups ensures this never happens */

@@ -992,11 +992,12 @@ parse_ofp_group_mod_str__(struct ofputil_group_mod *gm, int command,
         goto out;
     }
 
-    /* Exclude fields for non "hash" selection method. */
-    if (strcmp(gm->props.selection_method, "hash") &&
+    /* Exclude fields for non "hash or maglev" selection method. */
+    if (strcmp(gm->props.selection_method, "hash") && 
+        strcmp(gm->props.selection_method, "maglev") &&
         gm->props.fields.values_size) {
         error = xstrdup("fields may only be specified with "
-                        "\"selection_method=hash\"");
+                        "\"selection_method=[hash|maglev]\"");
         goto out;
     }
     /* Exclude selection_method_param if no selection_method is given. */
@@ -1577,8 +1578,9 @@ parse_group_prop_ntr_selection_method(struct ofpbuf *payload,
         return OFPERR_OFPBPC_BAD_VALUE;
     }
 
-    if (strcmp("hash", prop->selection_method)
-        && strcmp("dp_hash", prop->selection_method)) {
+    if (strcmp("hash", prop->selection_method) && 
+        strcmp("dp_hash", prop->selection_method) &&
+        strcmp("maglev", prop->selection_method)) {
         OFPPROP_LOG(&rl, false,
                     "ntr selection method '%s' is not supported",
                     prop->selection_method);
@@ -1592,7 +1594,9 @@ parse_group_prop_ntr_selection_method(struct ofpbuf *payload,
     ofpbuf_pull(payload, sizeof *prop);
 
     fields_len = ntohs(prop->length) - sizeof *prop;
-    if (fields_len && strcmp("hash", gp->selection_method)) {
+    if (fields_len && 
+        strcmp("hash", gp->selection_method) &&
+        strcmp("maglev", gp->selection_method)) {
         OFPPROP_LOG(&rl, false, "ntr selection method %s "
                     "does not support fields", gp->selection_method);
         return OFPERR_OFPBPC_BAD_VALUE;
