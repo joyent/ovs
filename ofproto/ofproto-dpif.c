@@ -5173,6 +5173,8 @@ group_set_selection_method(struct group_dpif *group)
             ds_destroy(&s);
             group->selection_method = SEL_METHOD_MAGLEV;
             group->hash_alg = (uint32_t)props->selection_method_param;
+            VLOG_DBG("Use maglev with the hash table size index: %d",
+                     group->hash_alg);
         } else {
             /* No hash fields. Fall back to original default hashing. */
             VLOG_DBG("No hash fields. Falling back to default hash method.");

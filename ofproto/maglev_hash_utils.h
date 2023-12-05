@@ -1,8 +1,7 @@
 #ifndef __MAGLEV_HASH_UTILS_H__
 #define __MAGLEV_HASH_UTILS_H__
 
-#define MH_DEBUG 1
-#ifdef MH_DEBUG
+#ifdef _MH_DEBUG
 # define dbg_print(fmt, ...) do { \
         VLOG_INFO("%s:%d:%s: " fmt, __FILE__, __LINE__, __func__, ##__VA_ARGS__); \
     } while(0)

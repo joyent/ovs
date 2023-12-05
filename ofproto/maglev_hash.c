@@ -20,6 +20,10 @@
  * modified for OpenvSwitch Group Function
  */
 
+//#define _USE_BUCKET_LIST 1
+//#define _DUMP_BUCKET 1
+//#define _MH_DEBUG 1
+
 #include <config.h>
 #include <errno.h>
 
@@ -29,8 +33,6 @@
 #include "maglev_hash.h"
 #include "ofproto/ofproto-dpif.h"
 #include "openvswitch/vlog.h"
-
-//#define _USE_BUCKET_LIST 1
 
 VLOG_DEFINE_THIS_MODULE(maglev_hash);
 
@@ -52,7 +54,7 @@ static inline uint32_t mh_hash2(uint8_t *data, uint32_t len)
 }
 
 static inline uint32_t mh_get_table_size(uint32_t idx) {
-    /* [0]:      for debugging
+    /* [0]     : for debugging
      * [1 ~ 10]: valid
      */
 
@@ -60,7 +62,7 @@ static inline uint32_t mh_get_table_size(uint32_t idx) {
 
     uint32_t len = sizeof(mh_primes) / sizeof(mh_primes[0]);
 
-    if (idx < 1 || idx > len) {
+    if (idx > len) {
         idx = CONFIG_MH_TAB_INDEX;
     }
 
@@ -79,6 +81,20 @@ static inline uint32_t is_unavailable(struct maglev_dest *dest)
 static struct maglev_dest* mh_get_lookup_dest(struct maglev_state *s, unsigned int hash_data, uint8_t try_use_secondary) 
 {
     unsigned int hash = hash_data % s->lookup_size;
+
+#if 0
+    struct maglev_dest *dest, *secondary;
+
+    dest = s->lookup[hash].dest[0];
+    secondary = s->lookup[hash].dest[1];
+
+    dbg_print("hash_data=%u, hash=%u, try_use_secondary=%u, primary=%u:%u:%u:%p, secondary=%u:%u:%u:%p", 
+              hash_data, hash,
+              try_use_secondary,
+              dest->gid, dest->dest_id, dest->weight, dest,
+              secondary->gid, secondary->dest_id, secondary->weight, secondary);
+#endif
+
     return try_use_secondary == 0 ? s->lookup[hash].dest[0] : s->lookup[hash].dest[1];
 }
 
@@ -172,12 +188,6 @@ static int mh_populate(struct maglev_state *s, struct maglev_hash_service *svc)
                 /* the first time or the old dest removed*/
                 s->lookup[c].dest[0] =  new_dest;
                 s->lookup[c].dest[1] =  new_dest;
-
-#if 0
-                dbg_print("new dest(%d): primary=%u:%u:%u:%p", 
-                          c, 
-                          new_dest->gid, new_dest->dest_id, new_dest->weight, new_dest);
-#endif
             } else if (dest != new_dest) {
                 s->lookup[c].dest[0] =  new_dest;
                 s->lookup[c].dest[1] =  dest;
@@ -254,7 +264,7 @@ static inline struct maglev_dest *mh_lookup_dest_fallback(struct maglev_state *s
     if (!is_unavailable(dest))
         return dest;
 
-    dbg_print("selected unavailable server(id=%u:%u), reselecting", dest->gid, dest->dest_id);
+    VLOG_INFO("selected unavailable server(id=%u:%u), reselecting", dest->gid, dest->dest_id);
 
     /* If the original dest is unavailable, loop around the table
      * starting from ihash to find a new dest
@@ -270,7 +280,7 @@ static inline struct maglev_dest *mh_lookup_dest_fallback(struct maglev_state *s
         if (!is_unavailable(dest))
             return dest;
 
-        dbg_print("selected unavailable server(id=%u:%u) (offset %u), reselecting", dest->gid, dest->dest_id, roffset);
+        VLOG_INFO("selected unavailable server(id=%u:%u) (offset %u), reselecting", dest->gid, dest->dest_id, roffset);
     }
 
     return NULL;
@@ -558,7 +568,7 @@ static int mh_add_dest(uint32_t gid, uint32_t id, uint16_t weight, void *data, s
         atomic_count_set(&dest->version, atomic_count_get(&svc->version));
 
         if ((uint16_t)dest->weight != weight) {
-            dbg_print("changed weight: id=%u:%u, weight: %u -> %u", 
+            VLOG_INFO("changed weight: id=%u:%u, weight: %u -> %u", 
                       dest->gid, dest->dest_id, dest->weight, weight);
 
             mh_set_dest_weight(dest, weight);
@@ -590,7 +600,7 @@ static int mh_add_dest(uint32_t gid, uint32_t id, uint16_t weight, void *data, s
     dest->dest_id = id;
     dest->data = data;
 
-    dbg_print("add dest: %u:%u:%u:%p", dest->gid, dest->dest_id, dest->weight, dest);
+    VLOG_INFO("add dest: %u:%u:%u:%p", dest->gid, dest->dest_id, dest->weight, dest);
 
     ovs_list_push_back(&svc->destinations, &dest->n_list);
 
@@ -617,7 +627,7 @@ static int mh_collect_dirty_dest(struct maglev_hash_service *svc, struct maglev_
 
         /* old version */
         ovs_list_remove(&dest->n_list);
-        dbg_print("dirty dest: %u:%u:%u:%p", dest->gid, dest->dest_id, dest->weight, dest);
+        VLOG_INFO("dirty dest: %u:%u:%u:%p", dest->gid, dest->dest_id, dest->weight, dest);
        
         if (cnt < num_dests) {
             dest->flags |= MH_DEST_FLAG_DIRTY;
@@ -732,7 +742,7 @@ static int mh_dump_lookup_table(struct maglev_hash_service *svc)
             }
         }
 
-#if 0
+#ifdef _DUMP_BUCKET
         struct maglev_dest *secondary;
         dest = lookup[i].dest[0];
         secondary = lookup[i].dest[1];
@@ -744,7 +754,7 @@ static int mh_dump_lookup_table(struct maglev_hash_service *svc)
     }
 
     for (i=0; i<num_dests; i++) {
-        dbg_print("Dest(%d): id=%u:%u:%u:%p, lookup cnt0=%u, cnt1=%u", 
+        VLOG_INFO("Dest(%d): id=%u:%u:%u:%p, lookup cnt0=%u, cnt1=%u", 
                   i, 
                   dcnt[i].dest->gid, dcnt[i].dest->dest_id, dcnt[i].dest->weight, dcnt[i].dest, 
                   dcnt[i].cnt[0], dcnt[i].cnt[1]);
@@ -874,11 +884,13 @@ static struct maglev_dest* mh_lookup_(struct maglev_hash_service *svc, uint32_t 
 
     mh_release_state(s);
 
+#if 0
     if (!dest) {
         VLOG_INFO("Lookup Dest is unavailable: hash_data=%u, try_use_secondary=%d", hash_data, try_use_secondary);
     } else if (try_use_secondary) {
         VLOG_INFO("Lookup Secondary Dest: %u:%u:%u:%p", dest->gid, dest->dest_id, dest->weight, dest);
     }
+#endif
 
     return dest;
 }

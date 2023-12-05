@@ -4611,12 +4611,10 @@ pick_default_select_group(struct xlate_ctx *ctx, struct group_dpif *group)
 static struct ofputil_bucket *
 pick_maglev_select_group(struct xlate_ctx *ctx, struct group_dpif *group)
 {
+    // bucket size
     uint32_t hash = 0;
     const struct field_array *fields = &group->up.props.fields;
     const uint8_t *mask_values = fields->values;
-
-    // bucket size
-    //hash = hash_uint64(group->up.props.selection_method_param);
 
     size_t i;
     BITMAP_FOR_EACH_1 (i, MFF_N_IDS, fields->used.bm) {
@@ -4665,7 +4663,8 @@ pick_maglev_select_group(struct xlate_ctx *ctx, struct group_dpif *group)
     }
 
     struct flow *flow = &ctx->xin->flow;
-    VLOG_INFO("MH: "IP_FMT":%u->"IP_FMT":%u(%d,0x%x), packet=%p, try_use_secondary=%d", 
+
+    VLOG_DBG("MH: "IP_FMT":%u->"IP_FMT":%u(%d,0x%x), packet=%p, try_use_secondary=%d", 
               IP_ARGS(flow->nw_src), ntohs(flow->tp_src),
               IP_ARGS(flow->nw_dst), ntohs(flow->tp_dst),
               flow->nw_proto, 
