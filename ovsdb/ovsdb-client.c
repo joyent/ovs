@@ -451,8 +451,9 @@ usage(void)
            "    wait until DATABASE reaches STATE "
            "(\"added\" or \"connected\" or \"removed\")\n"
            "    in DATBASE on SERVER.\n"
-           "\n  dump [SERVER] [DATABASE]\n"
-           "    dump contents of DATABASE on SERVER to stdout\n"
+           "\n  dump [SERVER] [DATABASE] [TABLE [COLUMN]...]\n"
+           "    dump contents of COLUMNs, TABLE (or all tables) in DATABASE\n"
+           "    on SERVER to stdout\n"
            "\n  backup [SERVER] [DATABASE] > SNAPSHOT\n"
            "    dump database contents in the form of a database file\n"
            "\n  [--force] restore [SERVER] [DATABASE] < SNAPSHOT\n"
@@ -473,6 +474,8 @@ usage(void)
     vlog_usage();
     ovs_replay_usage();
     printf("\nOther options:\n"
+           "  -t, --timeout=SECS          limits ovsdb-client runtime to\n"
+           "                              approximately SECS seconds.\n"
            "  -h, --help                  display this help message\n"
            "  -V, --version               display version information\n");
     exit(EXIT_SUCCESS);
@@ -552,7 +555,7 @@ static void
 check_ovsdb_error(struct ovsdb_error *error)
 {
     if (error) {
-        ovs_fatal(0, "%s", ovsdb_error_to_string(error));
+        ovs_fatal(0, "%s", ovsdb_error_to_string_free(error));
     }
 }
 
@@ -1843,7 +1846,7 @@ do_dump(struct jsonrpc *rpc, const char *database,
     struct ovsdb_schema *schema;
     struct json *transaction;
 
-    const struct shash_node *node, **tables;
+    const struct shash_node *node, **tables = NULL;
     size_t n_tables;
     struct ovsdb_table_schema *tschema;
     const struct shash *columns;
@@ -1869,8 +1872,10 @@ do_dump(struct jsonrpc *rpc, const char *database,
             shash_add(&custom_columns, argv[i], node->data);
         }
     } else {
-        tables = shash_sort(&schema->tables);
         n_tables = shash_count(&schema->tables);
+        if (n_tables) {
+            tables = shash_sort(&schema->tables);
+        }
     }
 
     /* Construct transaction to retrieve entire database. */

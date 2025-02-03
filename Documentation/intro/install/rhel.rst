@@ -92,11 +92,9 @@ Once that is completed, remove the file ``/tmp/ovs.spec``.
 If python3-sphinx package is not available in your version of RHEL, you can
 install it via pip with 'pip install sphinx'.
 
-Open vSwitch requires python 3.6 or newer which is not available in older
-distributions. In the case of RHEL 6.x and its derivatives, one option is
-to install python34 from `EPEL`_.
-
-.. _EPEL: https://fedoraproject.org/wiki/EPEL
+Open vSwitch requires python 3.7 or newer which is not available in older
+distributions.  For those, one option is to build and install required version
+from source.
 
 .. _rhel-bootstrapping:
 
@@ -211,7 +209,7 @@ implemented.  Refer to `README.RHEL.rst`__ in the source tree or
 /usr/share/doc/openvswitch/README.RHEL.rst in the installed openvswitch package
 for details.
 
-__ https://github.com/openvswitch/ovs/blob/master/rhel/README.RHEL.rst
+__ https://github.com/openvswitch/ovs/blob/main/rhel/README.RHEL.rst
 
 Reporting Bugs
 --------------

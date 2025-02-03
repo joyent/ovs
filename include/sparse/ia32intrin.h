@@ -1,4 +1,4 @@
-/* Copyright (c) 2020 Intel, Inc.
+/* Copyright (c) 2023 Red Hat, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,13 +17,7 @@
 #error "Use this header only with sparse.  It is not a correct implementation."
 #endif
 
-/* sparse doesn't know about gcc atomic builtins. */
-#ifndef __ATOMIC_ACQ_REL
-#define __ATOMIC_ACQ_REL 0
-#define __ATOMIC_RELAXED 1
-#define __atomic_add_fetch(p, val, memorder) (*(p) = *(p) + (val))
-#define __atomic_store_n(p, val, memorder) (*(p) = (val))
-#endif
+#define __builtin_ia32_rdtsc() (unsigned long long) 0
 
-/* Get actual <rte_mbuf.h> definitions for us to annotate and build on. */
-#include_next <rte_mbuf.h>
+/* Get actual <ia32intrin.h> definitions for us to annotate and build on. */
+#include_next <ia32intrin.h>

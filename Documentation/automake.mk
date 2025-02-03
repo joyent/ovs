@@ -45,7 +45,7 @@ DOC_SOURCE = \
 	Documentation/topics/fuzzing/ovs-fuzzing-infrastructure.rst \
 	Documentation/topics/fuzzing/ovs-fuzzers.rst \
 	Documentation/topics/fuzzing/security-analysis-of-ovs-fuzzers.rst \
-	Documentation/topics/testing.rst \
+	Documentation/topics/flow-visualization.rst \
 	Documentation/topics/integration.rst \
 	Documentation/topics/language-bindings.rst \
 	Documentation/topics/networking-namespaces.rst \
@@ -55,6 +55,7 @@ DOC_SOURCE = \
 	Documentation/topics/ovsdb-replication.rst \
 	Documentation/topics/porting.rst \
 	Documentation/topics/record-replay.rst \
+	Documentation/topics/testing.rst \
 	Documentation/topics/tracing.rst \
 	Documentation/topics/usdt-probes.rst \
 	Documentation/topics/userspace-checksum-offloading.rst \
@@ -109,6 +110,7 @@ DOC_SOURCE = \
 	Documentation/internals/security.rst \
 	Documentation/internals/contributing/index.rst \
 	Documentation/internals/contributing/backporting-patches.rst \
+	Documentation/internals/contributing/inclusive-language.rst \
 	Documentation/internals/contributing/coding-style.rst \
 	Documentation/internals/contributing/coding-style-windows.rst \
 	Documentation/internals/contributing/documentation-style.rst \
@@ -161,6 +163,7 @@ RST_MANPAGES = \
 	ovs-actions.7.rst \
 	ovs-appctl.8.rst \
 	ovs-ctl.8.rst \
+	ovs-flowviz.8.rst \
 	ovs-l3ping.8.rst \
 	ovs-parse-backtrace.8.rst \
 	ovs-pki.8.rst \

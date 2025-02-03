@@ -50,6 +50,7 @@ COVERAGE_DEFINE(conntrack_full);
 COVERAGE_DEFINE(conntrack_l3csum_err);
 COVERAGE_DEFINE(conntrack_l4csum_err);
 COVERAGE_DEFINE(conntrack_lookup_natted_miss);
+COVERAGE_DEFINE(conntrack_zone_full);
 
 struct conn_lookup_ctx {
     struct conn_key key;
@@ -254,7 +255,9 @@ conntrack_init(void)
 
     ovs_mutex_init_adaptive(&ct->ct_lock);
     ovs_mutex_lock(&ct->ct_lock);
-    cmap_init(&ct->conns);
+    for (unsigned i = 0; i < ARRAY_SIZE(ct->conns); i++) {
+        cmap_init(&ct->conns[i]);
+    }
     for (unsigned i = 0; i < ARRAY_SIZE(ct->exp_lists); i++) {
         rculist_init(&ct->exp_lists[i]);
     }
@@ -267,6 +270,7 @@ conntrack_init(void)
     atomic_init(&ct->n_conn_limit, DEFAULT_N_CONN_LIMIT);
     atomic_init(&ct->tcp_seq_chk, true);
     atomic_init(&ct->sweep_ms, 20000);
+    atomic_init(&ct->default_zone_limit, 0);
     latch_init(&ct->clean_thread_exit);
     ct->clean_thread = ovs_thread_create("ct_clean", clean_thread_main, ct);
     ct->ipf = ipf_init();
@@ -291,6 +295,28 @@ zone_key_hash(int32_t zone, uint32_t basis)
 {
     size_t hash = hash_int((OVS_FORCE uint32_t) zone, basis);
     return hash;
+}
+
+static int64_t
+zone_limit_get_limit__(struct conntrack_zone_limit *czl)
+{
+    int64_t limit;
+    atomic_read_relaxed(&czl->limit, &limit);
+
+    return limit;
+}
+
+static int64_t
+zone_limit_get_limit(struct conntrack *ct, struct conntrack_zone_limit *czl)
+{
+    int64_t limit = zone_limit_get_limit__(czl);
+
+    if (limit == ZONE_LIMIT_CONN_DEFAULT) {
+        atomic_read_relaxed(&ct->default_zone_limit, &limit);
+        limit = limit ? limit : -1;
+    }
+
+    return limit;
 }
 
 static struct zone_limit *
@@ -321,62 +347,194 @@ zone_limit_lookup(struct conntrack *ct, int32_t zone)
 }
 
 static struct zone_limit *
-zone_limit_lookup_or_default(struct conntrack *ct, int32_t zone)
+zone_limit_create__(struct conntrack *ct, int32_t zone, int64_t limit)
+    OVS_REQUIRES(ct->ct_lock)
 {
-    struct zone_limit *zl = zone_limit_lookup(ct, zone);
-    return zl ? zl : zone_limit_lookup(ct, DEFAULT_ZONE);
-}
+    struct zone_limit *zl = NULL;
 
-struct conntrack_zone_limit
-zone_limit_get(struct conntrack *ct, int32_t zone)
-{
-    struct conntrack_zone_limit czl = {
-        .zone = DEFAULT_ZONE,
-        .limit = 0,
-        .count = ATOMIC_COUNT_INIT(0),
-        .zone_limit_seq = 0,
-    };
-    struct zone_limit *zl = zone_limit_lookup_or_default(ct, zone);
-    if (zl) {
-        czl = zl->czl;
+    if (zone > DEFAULT_ZONE && zone <= MAX_ZONE) {
+        zl = xmalloc(sizeof *zl);
+        atomic_init(&zl->czl.limit, limit);
+        atomic_count_init(&zl->czl.count, 0);
+        zl->czl.zone = zone;
+        zl->czl.zone_limit_seq = ct->zone_limit_seq++;
+        uint32_t hash = zone_key_hash(zone, ct->hash_basis);
+        cmap_insert(&ct->zone_limits, &zl->node, hash);
     }
-    return czl;
+
+    return zl;
 }
 
-static int
-zone_limit_create(struct conntrack *ct, int32_t zone, uint32_t limit)
+static struct zone_limit *
+zone_limit_create(struct conntrack *ct, int32_t zone, int64_t limit)
     OVS_REQUIRES(ct->ct_lock)
 {
     struct zone_limit *zl = zone_limit_lookup_protected(ct, zone);
 
     if (zl) {
-        return 0;
+        return zl;
     }
 
-    if (zone >= DEFAULT_ZONE && zone <= MAX_ZONE) {
-        zl = xzalloc(sizeof *zl);
-        zl->czl.limit = limit;
-        zl->czl.zone = zone;
-        zl->czl.zone_limit_seq = ct->zone_limit_seq++;
-        uint32_t hash = zone_key_hash(zone, ct->hash_basis);
-        cmap_insert(&ct->zone_limits, &zl->node, hash);
-        return 0;
+    return zone_limit_create__(ct, zone, limit);
+}
+
+/* Lazily creates a new entry in the zone_limits cmap if default limit
+ * is set and there's no entry for the zone. */
+static struct zone_limit *
+zone_limit_lookup_or_default(struct conntrack *ct, int32_t zone)
+    OVS_REQUIRES(ct->ct_lock)
+{
+    struct zone_limit *zl = zone_limit_lookup_protected(ct, zone);
+
+    if (!zl) {
+        uint32_t limit;
+        atomic_read_relaxed(&ct->default_zone_limit, &limit);
+
+        if (limit) {
+            zl = zone_limit_create__(ct, zone, ZONE_LIMIT_CONN_DEFAULT);
+        }
+    }
+
+    return zl;
+}
+
+struct conntrack_zone_info
+zone_limit_get(struct conntrack *ct, int32_t zone)
+{
+    struct conntrack_zone_info czl = {
+        .zone = DEFAULT_ZONE,
+        .limit = 0,
+        .count = 0,
+    };
+    struct zone_limit *zl = zone_limit_lookup(ct, zone);
+    if (zl) {
+        int64_t czl_limit = zone_limit_get_limit__(&zl->czl);
+        if (czl_limit > ZONE_LIMIT_CONN_DEFAULT) {
+            czl.zone = zl->czl.zone;
+            czl.limit = czl_limit;
+        } else {
+            atomic_read_relaxed(&ct->default_zone_limit, &czl.limit);
+        }
+
+        czl.count = atomic_count_get(&zl->czl.count);
     } else {
-        return EINVAL;
+        atomic_read_relaxed(&ct->default_zone_limit, &czl.limit);
+    }
+
+    return czl;
+}
+
+static void
+zone_limit_clean__(struct conntrack *ct, struct zone_limit *zl)
+    OVS_REQUIRES(ct->ct_lock)
+{
+    uint32_t hash = zone_key_hash(zl->czl.zone, ct->hash_basis);
+    cmap_remove(&ct->zone_limits, &zl->node, hash);
+    ovsrcu_postpone(free, zl);
+}
+
+static void
+zone_limit_clean(struct conntrack *ct, struct zone_limit *zl)
+    OVS_REQUIRES(ct->ct_lock)
+{
+    uint32_t limit;
+
+    atomic_read_relaxed(&ct->default_zone_limit, &limit);
+    /* Do not remove the entry if the default limit is enabled, but
+     * simply move the limit to default. */
+    if (limit) {
+        atomic_store_relaxed(&zl->czl.limit, ZONE_LIMIT_CONN_DEFAULT);
+    } else {
+        zone_limit_clean__(ct, zl);
+    }
+}
+
+static void
+zone_limit_clean_default(struct conntrack *ct)
+    OVS_REQUIRES(ct->ct_lock)
+{
+    struct zone_limit *zl;
+    int64_t czl_limit;
+
+    atomic_store_relaxed(&ct->default_zone_limit, 0);
+
+    CMAP_FOR_EACH (zl, node, &ct->zone_limits) {
+        atomic_read_relaxed(&zl->czl.limit, &czl_limit);
+        if (zone_limit_get_limit__(&zl->czl) == ZONE_LIMIT_CONN_DEFAULT) {
+            zone_limit_clean__(ct, zl);
+        }
+    }
+}
+
+static bool
+zone_limit_delete__(struct conntrack *ct, int32_t zone)
+    OVS_REQUIRES(ct->ct_lock)
+{
+    struct zone_limit *zl = NULL;
+
+    if (zone == DEFAULT_ZONE) {
+        zone_limit_clean_default(ct);
+    } else {
+        zl = zone_limit_lookup_protected(ct, zone);
+        if (zl) {
+            zone_limit_clean(ct, zl);
+        }
+    }
+
+    return zl != NULL;
+}
+
+int
+zone_limit_delete(struct conntrack *ct, int32_t zone)
+{
+    bool deleted;
+
+    ovs_mutex_lock(&ct->ct_lock);
+    deleted = zone_limit_delete__(ct, zone);
+    ovs_mutex_unlock(&ct->ct_lock);
+
+    if (zone != DEFAULT_ZONE) {
+        VLOG_INFO(deleted
+                  ? "Deleted zone limit for zone %d"
+                  : "Attempted delete of non-existent zone limit: zone %d",
+                  zone);
+    }
+
+    return 0;
+}
+
+static void
+zone_limit_update_default(struct conntrack *ct, int32_t zone, uint32_t limit)
+{
+    /* limit zero means delete default. */
+    if (limit == 0) {
+        ovs_mutex_lock(&ct->ct_lock);
+        zone_limit_delete__(ct, zone);
+        ovs_mutex_unlock(&ct->ct_lock);
+    } else {
+        atomic_store_relaxed(&ct->default_zone_limit, limit);
     }
 }
 
 int
 zone_limit_update(struct conntrack *ct, int32_t zone, uint32_t limit)
 {
+    struct zone_limit *zl;
     int err = 0;
-    struct zone_limit *zl = zone_limit_lookup(ct, zone);
+
+    if (zone == DEFAULT_ZONE) {
+        zone_limit_update_default(ct, zone, limit);
+        VLOG_INFO("Set default zone limit to %u", limit);
+        return err;
+    }
+
+    zl = zone_limit_lookup(ct, zone);
     if (zl) {
-        zl->czl.limit = limit;
+        atomic_store_relaxed(&zl->czl.limit, limit);
         VLOG_INFO("Changed zone limit of %u for zone %d", limit, zone);
     } else {
         ovs_mutex_lock(&ct->ct_lock);
-        err = zone_limit_create(ct, zone, limit);
+        err = zone_limit_create(ct, zone, limit) == NULL;
         ovs_mutex_unlock(&ct->ct_lock);
         if (!err) {
             VLOG_INFO("Created zone limit of %u for zone %d", limit, zone);
@@ -385,33 +543,8 @@ zone_limit_update(struct conntrack *ct, int32_t zone, uint32_t limit)
                       zone);
         }
     }
+
     return err;
-}
-
-static void
-zone_limit_clean(struct conntrack *ct, struct zone_limit *zl)
-    OVS_REQUIRES(ct->ct_lock)
-{
-    uint32_t hash = zone_key_hash(zl->czl.zone, ct->hash_basis);
-    cmap_remove(&ct->zone_limits, &zl->node, hash);
-    ovsrcu_postpone(free, zl);
-}
-
-int
-zone_limit_delete(struct conntrack *ct, uint16_t zone)
-{
-    ovs_mutex_lock(&ct->ct_lock);
-    struct zone_limit *zl = zone_limit_lookup_protected(ct, zone);
-    if (zl) {
-        zone_limit_clean(ct, zl);
-        ovs_mutex_unlock(&ct->ct_lock);
-        VLOG_INFO("Deleted zone limit for zone %d", zone);
-    } else {
-        ovs_mutex_unlock(&ct->ct_lock);
-        VLOG_INFO("Attempted delete of non-existent zone limit: zone %d",
-                  zone);
-    }
-    return 0;
 }
 
 static void
@@ -425,12 +558,14 @@ conn_clean__(struct conntrack *ct, struct conn *conn)
     }
 
     hash = conn_key_hash(&conn->key_node[CT_DIR_FWD].key, ct->hash_basis);
-    cmap_remove(&ct->conns, &conn->key_node[CT_DIR_FWD].cm_node, hash);
+    cmap_remove(&ct->conns[conn->key_node[CT_DIR_FWD].key.zone],
+                &conn->key_node[CT_DIR_FWD].cm_node, hash);
 
     if (conn->nat_action) {
         hash = conn_key_hash(&conn->key_node[CT_DIR_REV].key,
                              ct->hash_basis);
-        cmap_remove(&ct->conns, &conn->key_node[CT_DIR_REV].cm_node, hash);
+        cmap_remove(&ct->conns[conn->key_node[CT_DIR_REV].key.zone],
+                    &conn->key_node[CT_DIR_REV].cm_node, hash);
     }
 
     rculist_remove(&conn->node);
@@ -501,7 +636,9 @@ conntrack_destroy(struct conntrack *ct)
 
     ovs_mutex_lock(&ct->ct_lock);
 
-    cmap_destroy(&ct->conns);
+    for (unsigned i = 0; i < ARRAY_SIZE(ct->conns); i++) {
+        cmap_destroy(&ct->conns[i]);
+    }
     cmap_destroy(&ct->zone_limits);
     cmap_destroy(&ct->timeout_policies);
 
@@ -532,7 +669,7 @@ conn_key_lookup(struct conntrack *ct, const struct conn_key *key,
     struct conn *conn = NULL;
     bool found = false;
 
-    CMAP_FOR_EACH_WITH_HASH (keyn, cm_node, hash, &ct->conns) {
+    CMAP_FOR_EACH_WITH_HASH (keyn, cm_node, hash, &ct->conns[key->zone]) {
         if (keyn->dir == CT_DIR_FWD) {
             conn = CONTAINER_OF(keyn, struct conn, key_node[CT_DIR_FWD]);
         } else {
@@ -655,8 +792,7 @@ is_ftp_ctl(const enum ct_alg_ctl_type ct_alg_ctl)
 }
 
 static enum ct_alg_ctl_type
-get_alg_ctl_type(const struct dp_packet *pkt, ovs_be16 tp_src, ovs_be16 tp_dst,
-                 const char *helper)
+get_alg_ctl_type(const struct dp_packet *pkt, const char *helper)
 {
     /* CT_IPPORT_FTP/TFTP is used because IPPORT_FTP/TFTP in not defined
      * in OSX, at least in in.h. Since these values will never change, remove
@@ -666,26 +802,24 @@ get_alg_ctl_type(const struct dp_packet *pkt, ovs_be16 tp_src, ovs_be16 tp_dst,
     uint8_t ip_proto = get_ip_proto(pkt);
     struct udp_header *uh = dp_packet_l4(pkt);
     struct tcp_header *th = dp_packet_l4(pkt);
-    ovs_be16 ftp_src_port = htons(CT_IPPORT_FTP);
-    ovs_be16 ftp_dst_port = htons(CT_IPPORT_FTP);
-    ovs_be16 tftp_dst_port = htons(CT_IPPORT_TFTP);
+    ovs_be16 ftp_port = htons(CT_IPPORT_FTP);
+    ovs_be16 tftp_port = htons(CT_IPPORT_TFTP);
 
-    if (OVS_UNLIKELY(tp_dst)) {
-        if (helper && !strncmp(helper, "ftp", strlen("ftp"))) {
-            ftp_dst_port = tp_dst;
-        } else if (helper && !strncmp(helper, "tftp", strlen("tftp"))) {
-            tftp_dst_port = tp_dst;
+    if (helper) {
+        if ((ip_proto == IPPROTO_TCP) &&
+             !strncmp(helper, "ftp", strlen("ftp"))) {
+            return CT_ALG_CTL_FTP;
         }
-    } else if (OVS_UNLIKELY(tp_src)) {
-        if (helper && !strncmp(helper, "ftp", strlen("ftp"))) {
-            ftp_src_port = tp_src;
+        if ((ip_proto == IPPROTO_UDP) &&
+             !strncmp(helper, "tftp", strlen("tftp"))) {
+            return CT_ALG_CTL_TFTP;
         }
     }
 
-    if (ip_proto == IPPROTO_UDP && uh->udp_dst == tftp_dst_port) {
+    if (ip_proto == IPPROTO_UDP && uh->udp_dst == tftp_port) {
         return CT_ALG_CTL_TFTP;
     } else if (ip_proto == IPPROTO_TCP &&
-               (th->tcp_src == ftp_src_port || th->tcp_dst == ftp_dst_port)) {
+               (th->tcp_src == ftp_port || th->tcp_dst == ftp_port)) {
         return CT_ALG_CTL_FTP;
     }
     return CT_ALG_CTL_NONE;
@@ -909,11 +1043,17 @@ conn_not_found(struct conntrack *ct, struct dp_packet *pkt,
     }
 
     if (commit) {
+        int64_t czl_limit;
         struct conn_key_node *fwd_key_node, *rev_key_node;
         struct zone_limit *zl = zone_limit_lookup_or_default(ct,
                                                              ctx->key.zone);
-        if (zl && atomic_count_get(&zl->czl.count) >= zl->czl.limit) {
-            return nc;
+        if (zl) {
+            czl_limit = zone_limit_get_limit(ct, &zl->czl);
+            if (czl_limit >= 0 &&
+                atomic_count_get(&zl->czl.count) >= czl_limit) {
+                COVERAGE_INC(conntrack_zone_full);
+                return nc;
+            }
         }
 
         unsigned int n_conn_limit;
@@ -942,6 +1082,18 @@ conn_not_found(struct conntrack *ct, struct dp_packet *pkt,
             nc->parent_key = alg_exp->parent_key;
         }
 
+        ovs_mutex_init_adaptive(&nc->lock);
+        atomic_flag_clear(&nc->reclaimed);
+        fwd_key_node->dir = CT_DIR_FWD;
+        rev_key_node->dir = CT_DIR_REV;
+
+        if (zl) {
+            nc->admit_zone = zl->czl.zone;
+            nc->zone_limit_seq = zl->czl.zone_limit_seq;
+        } else {
+            nc->admit_zone = INVALID_ZONE;
+        }
+
         if (nat_action_info) {
             nc->nat_action = nat_action_info->nat_action;
 
@@ -963,24 +1115,20 @@ conn_not_found(struct conntrack *ct, struct dp_packet *pkt,
             nat_packet(pkt, nc, false, ctx->icmp_related);
             uint32_t rev_hash = conn_key_hash(&rev_key_node->key,
                                               ct->hash_basis);
-            cmap_insert(&ct->conns, &rev_key_node->cm_node, rev_hash);
+            cmap_insert(&ct->conns[ctx->key.zone],
+                        &rev_key_node->cm_node, rev_hash);
         }
 
-        ovs_mutex_init_adaptive(&nc->lock);
-        atomic_flag_clear(&nc->reclaimed);
-        fwd_key_node->dir = CT_DIR_FWD;
-        rev_key_node->dir = CT_DIR_REV;
-        cmap_insert(&ct->conns, &fwd_key_node->cm_node, ctx->hash);
+        cmap_insert(&ct->conns[ctx->key.zone],
+                    &fwd_key_node->cm_node, ctx->hash);
         conn_expire_push_front(ct, nc);
         atomic_count_inc(&ct->n_conn);
-        ctx->conn = nc; /* For completeness. */
+
         if (zl) {
-            nc->admit_zone = zl->czl.zone;
-            nc->zone_limit_seq = zl->czl.zone_limit_seq;
             atomic_count_inc(&zl->czl.count);
-        } else {
-            nc->admit_zone = INVALID_ZONE;
         }
+
+        ctx->conn = nc; /* For completeness. */
     }
 
     return nc;
@@ -1227,8 +1375,7 @@ process_one(struct conntrack *ct, struct dp_packet *pkt,
             bool force, bool commit, long long now, const uint32_t *setmark,
             const struct ovs_key_ct_labels *setlabel,
             const struct nat_action_info_t *nat_action_info,
-            ovs_be16 tp_src, ovs_be16 tp_dst, const char *helper,
-            uint32_t tp_id)
+            const char *helper, uint32_t tp_id)
 {
     /* Reset ct_state whenever entering a new zone. */
     if (pkt->md.ct_state && pkt->md.ct_zone != zone) {
@@ -1249,8 +1396,11 @@ process_one(struct conntrack *ct, struct dp_packet *pkt,
         conn = NULL;
     }
 
-    enum ct_alg_ctl_type ct_alg_ctl = get_alg_ctl_type(pkt, tp_src, tp_dst,
-                                                       helper);
+    if (conn && helper == NULL) {
+        helper = conn->alg;
+    }
+
+    enum ct_alg_ctl_type ct_alg_ctl = get_alg_ctl_type(pkt, helper);
 
     if (OVS_LIKELY(conn)) {
         if (OVS_LIKELY(!conn_update_state_alg(ct, pkt, ctx, conn,
@@ -1327,7 +1477,7 @@ conntrack_execute(struct conntrack *ct, struct dp_packet_batch *pkt_batch,
                   ovs_be16 dl_type, bool force, bool commit, uint16_t zone,
                   const uint32_t *setmark,
                   const struct ovs_key_ct_labels *setlabel,
-                  ovs_be16 tp_src, ovs_be16 tp_dst, const char *helper,
+                  const char *helper,
                   const struct nat_action_info_t *nat_action_info,
                   long long now, uint32_t tp_id)
 {
@@ -1339,11 +1489,16 @@ conntrack_execute(struct conntrack *ct, struct dp_packet_batch *pkt_batch,
 
     DP_PACKET_BATCH_FOR_EACH (i, packet, pkt_batch) {
         struct conn *conn = packet->md.conn;
+
+        if (helper == NULL && conn != NULL) {
+            helper = conn->alg;
+        }
+
         if (OVS_UNLIKELY(packet->md.ct_state == CS_INVALID)) {
             write_ct_md(packet, zone, NULL, NULL, NULL);
         } else if (conn &&
                    conn->key_node[CT_DIR_FWD].key.zone == zone && !force &&
-                   !get_alg_ctl_type(packet, tp_src, tp_dst, helper)) {
+                   !get_alg_ctl_type(packet, helper)) {
             process_one_fast(zone, setmark, setlabel, nat_action_info,
                              conn, packet);
         } else if (OVS_UNLIKELY(!conn_key_extract(ct, packet, dl_type, &ctx,
@@ -1352,8 +1507,7 @@ conntrack_execute(struct conntrack *ct, struct dp_packet_batch *pkt_batch,
             write_ct_md(packet, zone, NULL, NULL, NULL);
         } else {
             process_one(ct, packet, &ctx, zone, force, commit, now, setmark,
-                        setlabel, nat_action_info, tp_src, tp_dst, helper,
-                        tp_id);
+                        setlabel, nat_action_info, helper, tp_id);
         }
     }
 
@@ -1424,18 +1578,25 @@ conntrack_get_sweep_interval(struct conntrack *ct)
 }
 
 static size_t
-ct_sweep(struct conntrack *ct, struct rculist *list, long long now)
+ct_sweep(struct conntrack *ct, struct rculist *list, long long now,
+         size_t *cleaned_count)
     OVS_NO_THREAD_SAFETY_ANALYSIS
 {
     struct conn *conn;
+    size_t cleaned = 0;
     size_t count = 0;
 
     RCULIST_FOR_EACH (conn, node, list) {
         if (conn_expired(conn, now)) {
             conn_clean(ct, conn);
+            cleaned++;
         }
 
         count++;
+    }
+
+    if (cleaned_count) {
+        *cleaned_count = cleaned;
     }
 
     return count;
@@ -1450,22 +1611,27 @@ conntrack_clean(struct conntrack *ct, long long now)
     long long next_wakeup = now + conntrack_get_sweep_interval(ct);
     unsigned int n_conn_limit, i;
     size_t clean_end, count = 0;
+    size_t total_cleaned = 0;
 
     atomic_read_relaxed(&ct->n_conn_limit, &n_conn_limit);
     clean_end = n_conn_limit / 64;
 
     for (i = ct->next_sweep; i < N_EXP_LISTS; i++) {
+        size_t cleaned;
+
         if (count > clean_end) {
             next_wakeup = 0;
             break;
         }
 
-        count += ct_sweep(ct, &ct->exp_lists[i], now);
+        count += ct_sweep(ct, &ct->exp_lists[i], now, &cleaned);
+        total_cleaned += cleaned;
     }
 
     ct->next_sweep = (i < N_EXP_LISTS) ? i : 0;
 
-    VLOG_DBG("conntrack cleanup %"PRIuSIZE" entries in %lld msec", count,
+    VLOG_DBG("conntrack cleaned %"PRIuSIZE" entries out of %"PRIuSIZE
+             " entries in %lld msec", total_cleaned, count,
              time_msec() - now);
 
     return next_wakeup;
@@ -2197,17 +2363,21 @@ nat_range_hash(const struct conn_key *key, uint32_t basis,
 {
     uint32_t hash = basis;
 
+    if (!basis) {
+        hash = ct_addr_hash_add(hash, &key->src.addr);
+    } else {
+        hash = ct_endpoint_hash_add(hash, &key->src);
+        hash = ct_endpoint_hash_add(hash, &key->dst);
+    }
+
     hash = ct_addr_hash_add(hash, &nat_info->min_addr);
     hash = ct_addr_hash_add(hash, &nat_info->max_addr);
     hash = hash_add(hash,
                     ((uint32_t) nat_info->max_port << 16)
                     | nat_info->min_port);
-    hash = ct_endpoint_hash_add(hash, &key->src);
-    hash = ct_endpoint_hash_add(hash, &key->dst);
     hash = hash_add(hash, (OVS_FORCE uint32_t) key->dl_type);
     hash = hash_add(hash, key->nw_proto);
     hash = hash_add(hash, key->zone);
-
     /* The purpose of the second parameter is to distinguish hashes of data of
      * different length; our data always has the same length so there is no
      * value in counting. */
@@ -2217,7 +2387,7 @@ nat_range_hash(const struct conn_key *key, uint32_t basis,
 /* Ports are stored in host byte order for convenience. */
 static void
 set_sport_range(const struct nat_action_info_t *ni, const struct conn_key *k,
-                uint32_t hash, uint16_t *curr, uint16_t *min,
+                uint32_t off, uint16_t *curr, uint16_t *min,
                 uint16_t *max)
 {
     if (((ni->nat_action & NAT_ACTION_SNAT_ALL) == NAT_ACTION_SRC) ||
@@ -2236,19 +2406,19 @@ set_sport_range(const struct nat_action_info_t *ni, const struct conn_key *k,
     } else {
         *min = ni->min_port;
         *max = ni->max_port;
-        *curr = *min + (hash % ((*max - *min) + 1));
+        *curr =  *min + (off % ((*max - *min) + 1));
     }
 }
 
 static void
 set_dport_range(const struct nat_action_info_t *ni, const struct conn_key *k,
-                uint32_t hash, uint16_t *curr, uint16_t *min,
+                uint32_t off, uint16_t *curr, uint16_t *min,
                 uint16_t *max)
 {
     if (ni->nat_action & NAT_ACTION_DST_PORT) {
         *min = ni->min_port;
         *max = ni->max_port;
-        *curr = *min + (hash % ((*max - *min) + 1));
+        *curr = *min + (off % ((*max - *min) + 1));
     } else {
         *curr = ntohs(k->dst.port);
         *min = *max = *curr;
@@ -2285,7 +2455,9 @@ find_addr(const struct conn_key *key, union ct_addr *min,
           uint32_t hash, bool ipv4,
           const struct nat_action_info_t *nat_info)
 {
-    const union ct_addr zero_ip = {0};
+    union ct_addr zero_ip;
+
+    memset(&zero_ip, 0, sizeof zero_ip);
 
     /* All-zero case. */
     if (!memcmp(min, &zero_ip, sizeof *min)) {
@@ -2377,24 +2549,38 @@ nat_get_unique_tuple(struct conntrack *ct, struct conn *conn,
 {
     struct conn_key *fwd_key = &conn->key_node[CT_DIR_FWD].key;
     struct conn_key *rev_key = &conn->key_node[CT_DIR_REV].key;
-    union ct_addr min_addr = {0}, max_addr = {0}, addr = {0};
     bool pat_proto = fwd_key->nw_proto == IPPROTO_TCP ||
                      fwd_key->nw_proto == IPPROTO_UDP ||
                      fwd_key->nw_proto == IPPROTO_SCTP;
     uint16_t min_dport, max_dport, curr_dport;
     uint16_t min_sport, max_sport, curr_sport;
-    uint32_t hash;
+    union ct_addr min_addr, max_addr, addr;
+    uint32_t hash, port_off, basis;
 
-    hash = nat_range_hash(fwd_key, ct->hash_basis, nat_info);
+    memset(&min_addr, 0, sizeof min_addr);
+    memset(&max_addr, 0, sizeof max_addr);
+    memset(&addr, 0, sizeof addr);
+
+    basis = (nat_info->nat_flags & NAT_PERSISTENT) ? 0 : ct->hash_basis;
+    hash = nat_range_hash(fwd_key, basis, nat_info);
+
+    if (nat_info->nat_flags & NAT_RANGE_RANDOM) {
+        port_off = random_uint32();
+    } else if (basis) {
+        port_off = hash;
+    } else {
+        port_off = nat_range_hash(fwd_key, ct->hash_basis, nat_info);
+    }
+
     min_addr = nat_info->min_addr;
     max_addr = nat_info->max_addr;
 
     find_addr(fwd_key, &min_addr, &max_addr, &addr, hash,
               (fwd_key->dl_type == htons(ETH_TYPE_IP)), nat_info);
 
-    set_sport_range(nat_info, fwd_key, hash, &curr_sport,
+    set_sport_range(nat_info, fwd_key, port_off, &curr_sport,
                     &min_sport, &max_sport);
-    set_dport_range(nat_info, fwd_key, hash, &curr_dport,
+    set_dport_range(nat_info, fwd_key, port_off, &curr_dport,
                     &min_dport, &max_dport);
 
     if (pat_proto) {
@@ -2567,7 +2753,9 @@ tuple_to_conn_key(const struct ct_dpif_tuple *tuple, uint16_t zone,
         key->src.icmp_type = tuple->icmp_type;
         key->src.icmp_code = tuple->icmp_code;
         key->dst.icmp_id = tuple->icmp_id;
-        key->dst.icmp_type = reverse_icmp_type(tuple->icmp_type);
+        key->dst.icmp_type = (tuple->ip_proto == IPPROTO_ICMP)
+                             ? reverse_icmp_type(tuple->icmp_type)
+                             : reverse_icmp6_type(tuple->icmp_type);
         key->dst.icmp_code = tuple->icmp_code;
     } else {
         key->src.port = tuple->src_port;
@@ -2628,42 +2816,43 @@ conntrack_dump_start(struct conntrack *ct, struct conntrack_dump *dump,
     if (pzone) {
         dump->zone = *pzone;
         dump->filter_zone = true;
+        dump->current_zone = dump->zone;
     }
 
     dump->ct = ct;
     *ptot_bkts = 1; /* Need to clean up the callers. */
+    dump->cursor = cmap_cursor_start(&dump->ct->conns[dump->current_zone]);
     return 0;
 }
 
 int
 conntrack_dump_next(struct conntrack_dump *dump, struct ct_dpif_entry *entry)
 {
-    struct conntrack *ct = dump->ct;
     long long now = time_msec();
 
-    for (;;) {
-        struct cmap_node *cm_node = cmap_next_position(&ct->conns,
-                                                       &dump->cm_pos);
-        if (!cm_node) {
-            break;
-        }
-        struct conn_key_node *keyn;
-        struct conn *conn;
+    struct conn_key_node *keyn;
+    struct conn *conn;
 
-        INIT_CONTAINER(keyn, cm_node, cm_node);
-        if (keyn->dir != CT_DIR_FWD) {
-            continue;
-        }
+    while (true) {
+        CMAP_CURSOR_FOR_EACH_CONTINUE (keyn, cm_node, &dump->cursor) {
+            if (keyn->dir != CT_DIR_FWD) {
+                continue;
+            }
 
-        conn = CONTAINER_OF(keyn, struct conn, key_node[CT_DIR_FWD]);
-        if (conn_expired(conn, now)) {
-            continue;
-        }
+            conn = CONTAINER_OF(keyn, struct conn, key_node[CT_DIR_FWD]);
+            if (conn_expired(conn, now)) {
+                continue;
+            }
 
-        if (!dump->filter_zone || keyn->key.zone == dump->zone) {
             conn_to_ct_dpif_entry(conn, entry, now);
             return 0;
         }
+
+        if (dump->filter_zone || dump->current_zone == UINT16_MAX) {
+            break;
+        }
+        dump->current_zone++;
+        dump->cursor = cmap_cursor_start(&dump->ct->conns[dump->current_zone]);
     }
 
     return EOF;
@@ -2741,20 +2930,32 @@ conntrack_exp_dump_done(struct conntrack_dump *dump OVS_UNUSED)
     return 0;
 }
 
-int
-conntrack_flush(struct conntrack *ct, const uint16_t *zone)
+static int
+conntrack_flush_zone(struct conntrack *ct, const uint16_t zone)
 {
     struct conn_key_node *keyn;
     struct conn *conn;
 
-    CMAP_FOR_EACH (keyn, cm_node, &ct->conns) {
+    CMAP_FOR_EACH (keyn, cm_node, &ct->conns[zone]) {
         if (keyn->dir != CT_DIR_FWD) {
             continue;
         }
         conn = CONTAINER_OF(keyn, struct conn, key_node[CT_DIR_FWD]);
-        if (!zone || *zone == keyn->key.zone) {
-            conn_clean(ct, conn);
-        }
+        conn_clean(ct, conn);
+    }
+
+    return 0;
+}
+
+int
+conntrack_flush(struct conntrack *ct, const uint16_t *zone)
+{
+    if (zone) {
+        return conntrack_flush_zone(ct, *zone);
+    }
+
+    for (unsigned i = 0; i < ARRAY_SIZE(ct->conns); i++) {
+        conntrack_flush_zone(ct, i);
     }
 
     return 0;

@@ -137,7 +137,7 @@ m4_divert_pop([PREPARE_TESTS])
 #
 # TITLE is provided to AT_SETUP and KEYWORDS to AT_KEYWORDS.
 m4_define([OVSDB_CHECK_EXECUTION_RO],
-  [AT_SETUP([$1])
+  [AT_SETUP([ovsdb - $1])
    AT_KEYWORDS([ovsdb execute execution positive $5])
    AT_CHECK([test-ovsdb execute-readonly "`$2`" m4_foreach([txn], [$3],
                                          [ 'txn'])], [0], [stdout], [])
@@ -175,7 +175,7 @@ OVSDB_CHECK_EXECUTION_RO([allow select on read only DB],
 #
 # TITLE is provided to AT_SETUP and KEYWORDS to AT_KEYWORDS.
 m4_define([OVSDB_CHECK_EXECUTION],
-  [AT_SETUP([$1])
+  [AT_SETUP([ovsdb - $1])
    AT_KEYWORDS([ovsdb execute execution positive $5])
    AT_CHECK([test-ovsdb execute "`$2`" m4_foreach([txn], [$3], [ 'txn'])],
      [0], [stdout], [])
@@ -1200,5 +1200,56 @@ OVSDB_CHECK_EXECUTION([garbage collection],
 [{"uuid":["uuid","<13>"]}]
 [{"rows":[]}]
 ]])])
+
+OVSDB_CHECK_EXECUTION([insert rows, count with mutation],
+  [ordinal_schema],
+  [[[["ordinals",
+      {"op": "insert",
+       "table": "ordinals",
+       "row": {"number": 0, "name": "zero"},
+       "uuid-name": "first"}]]],
+   [[["ordinals",
+      {"op": "insert",
+       "table": "ordinals",
+       "row": {"number": 1, "name": "one"},
+       "uuid-name": "first"}]]],
+   [[["ordinals",
+      {"op": "mutate",
+       "table": "ordinals",
+       "where": [["name", "==", "zero"]],
+       "mutations": []}]]],
+   [[["ordinals",
+      {"op": "mutate",
+       "table": "ordinals",
+       "where": [["name", "==", "one"]],
+       "mutations": []}]]],
+   [[["ordinals",
+      {"op": "insert",
+       "table": "ordinals",
+       "row": {"number": 2, "name": "one"},
+       "uuid-name": "first"}]]],
+   [[["ordinals",
+      {"op": "mutate",
+       "table": "ordinals",
+       "where": [["name", "==", "one"]],
+       "mutations": []}]]],
+   [[["ordinals",
+      {"op": "delete",
+       "table": "ordinals",
+       "where": [["name", "==", "zero"]]}]]],
+   [[["ordinals",
+      {"op": "mutate",
+       "table": "ordinals",
+       "where": [],
+       "mutations": []}]]]],
+  [[[{"uuid":["uuid","<0>"]}]
+[{"uuid":["uuid","<1>"]}]
+[{"count":1}]
+[{"count":1}]
+[{"uuid":["uuid","<2>"]}]
+[{"count":2}]
+[{"count":1}]
+[{"count":2}]
+]])
 
 EXECUTION_EXAMPLES

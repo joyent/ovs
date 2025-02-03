@@ -820,6 +820,7 @@ check_condition(const struct ovsdb_idl_table_class *table,
         type.value.type = OVSDB_TYPE_VOID;
         error = ovsdb_datum_from_string(&b, &type, value_string, symtab);
         if (error) {
+            ovsdb_atom_destroy(&want_key, column->type.key.type);
             goto out;
         }
 
@@ -830,14 +831,10 @@ check_condition(const struct ovsdb_idl_table_class *table,
         } else {
             struct ovsdb_datum a;
 
+            ovsdb_datum_init_empty(&a);
             if (found) {
                 a.n = 1;
                 a.keys = &have_datum->values[idx];
-                a.values = NULL;
-            } else {
-                a.n = 0;
-                a.keys = NULL;
-                a.values = NULL;
             }
 
             retval = evaluate_relop(&a, &b, &type, operator);
@@ -1159,8 +1156,8 @@ list_record(const struct ovsdb_idl_row *row,
 
             atom.uuid = row->uuid;
 
+            ovsdb_datum_init_empty(&datum);
             datum.keys = &atom;
-            datum.values = NULL;
             datum.n = 1;
 
             cell->json = ovsdb_datum_to_json(&datum, &ovsdb_type_uuid);
@@ -1374,6 +1371,7 @@ set_column(const struct ovsdb_idl_table_class *table,
         error = ovsdb_atom_from_string(&value, NULL, &column->type.value,
                                        value_string, symtab);
         if (error) {
+            ovsdb_atom_destroy(&key, column->type.key.type);
             goto out;
         }
 
@@ -2654,6 +2652,7 @@ ctl_context_init(struct ctl_context *ctx, struct ctl_command *command,
                  struct ovsdb_symbol_table *symtab,
                  void (*invalidate_cache_cb)(struct ctl_context *))
 {
+    ds_init(&ctx->output);
     if (command) {
         ctl_context_init_command(ctx, command, false);
     }
@@ -2686,6 +2685,7 @@ ctl_context_done(struct ctl_context *ctx,
         ctl_context_done_command(ctx, command);
     }
     invalidate_cache(ctx);
+    ds_destroy(&ctx->output);
 }
 
 char * OVS_WARN_UNUSED_RESULT

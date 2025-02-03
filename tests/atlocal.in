@@ -1,6 +1,5 @@
 # -*- shell-script -*-
 HAVE_OPENSSL='@HAVE_OPENSSL@'
-OPENSSL_SUPPORTS_SNI='@OPENSSL_SUPPORTS_SNI@'
 HAVE_UNBOUND='@HAVE_UNBOUND@'
 HAVE_BACKTRACE='@HAVE_BACKTRACE@'
 HAVE_UNWIND='@HAVE_UNWIND@'
@@ -185,6 +184,12 @@ find_command lftp
 # Set HAVE_ETHTOOL
 find_command ethtool
 
+# Set HAVE_IPTABLES
+find_command iptables
+
+# Set HAVE_NFT
+find_command nft
+
 CURL_OPT="-g -v --max-time 1 --retry 2 --retry-delay 1 --connect-timeout 1"
 
 # Determine whether "diff" supports "normal" diffs.  (busybox diff does not.)
@@ -193,16 +198,6 @@ if echo xyzzy | diff /dev/null - | grep '^>' >/dev/null; then
 else
     DIFF_SUPPORTS_NORMAL_FORMAT=no
 fi
-
-# Check whether UB Sanitizer is being used.
-case "$CFLAGS" in
-*fsanitize=undefined*)
-    TESTS_WITH_UBSAN=yes
-    ;;
-*)
-    TESTS_WITH_UBSAN=no
-    ;;
-esac
 
 # Turn off proxies.
 unset http_proxy
@@ -227,30 +222,47 @@ export OVS_CTL_TIMEOUT
 #
 # We disable leak detection because otherwise minor leaks that don't
 # matter break everything.
-ASAN_OPTIONS=detect_leaks=0:abort_on_error=true:log_path=asan:$ASAN_OPTIONS
+ASAN_OPTIONS=detect_leaks=0:abort_on_error=true:log_path=sanitizers:$ASAN_OPTIONS
 export ASAN_OPTIONS
 
 # Add some default flags for UndefinedBehaviorSanitizer, if it was used
 # for the build.
-UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=true:log_path=ubsan:$UBSAN_OPTIONS
+UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=true:log_path=sanitizers:$UBSAN_OPTIONS
 export UBSAN_OPTIONS
 
 # Check whether Python test requirements are available.
 REQUIREMENT_PATH=$abs_top_srcdir/python/test_requirements.txt $PYTHON3 -c '
 import os
 import pathlib
-import pkg_resources
 import sys
 
+PACKAGING = True
+try:
+    from packaging import requirements
+    from importlib import metadata
+except ModuleNotFoundError:
+    PACKAGING = False
+    import pkg_resources
+
 with pathlib.Path(os.path.join(os.getenv("REQUIREMENT_PATH"))).open() as reqs:
-    for req in pkg_resources.parse_requirements(reqs):
-        try:
-            pkg_resources.require(str(req))
-        except pkg_resources.DistributionNotFound:
-            sys.exit(2)
+    if PACKAGING:
+        for req in reqs.readlines():
+            try:
+                r = requirements.Requirement(req.strip())
+                if metadata.version(r.name) not in r.specifier:
+                    raise metadata.PackageNotFoundError
+            except metadata.PackageNotFoundError:
+                sys.exit(2)
+    else:
+        for req in pkg_resources.parse_requirements(reqs):
+            try:
+                pkg_resources.require(str(req))
+            except pkg_resources.DistributionNotFound:
+                sys.exit(2)
 '
 case $? in
     0) HAVE_PYTEST=yes ;;
     2) HAVE_PYTEST=no ;;
-    *) echo "$0: unexpected error probing Python unit test requirements" >&2 ;;
+    *) HAVE_PYTEST=no
+       echo "$0: unexpected error probing Python unit test requirements" >&2 ;;
 esac

@@ -79,8 +79,8 @@ COVERAGE_DEFINE(ofproto_update_port);
 
 /* Default fields to use for prefix tries in each flow table, unless something
  * else is configured. */
-const enum mf_field_id default_prefix_fields[2] =
-    { MFF_IPV4_DST, MFF_IPV4_SRC };
+const enum mf_field_id default_prefix_fields[4] =
+    { MFF_IPV4_DST, MFF_IPV4_SRC, MFF_IPV6_DST, MFF_IPV6_SRC };
 
 /* oftable. */
 static void oftable_init(struct oftable *);
@@ -312,6 +312,7 @@ unsigned ofproto_max_idle = OFPROTO_MAX_IDLE_DEFAULT;
 unsigned ofproto_max_revalidator = OFPROTO_MAX_REVALIDATOR_DEFAULT;
 unsigned ofproto_min_revalidate_pps = OFPROTO_MIN_REVALIDATE_PPS_DEFAULT;
 unsigned ofproto_offloaded_stats_delay = OFPROTO_OFFLOADED_STATS_DELAY;
+bool ofproto_explicit_sampled_drops = OFPROTO_EXPLICIT_SAMPLED_DROPS_DEFAULT;
 
 uint32_t n_handlers, n_revalidators;
 
@@ -737,6 +738,14 @@ ofproto_set_offloaded_stats_delay(unsigned offloaded_stats_delay)
     ofproto_offloaded_stats_delay = offloaded_stats_delay;
 }
 
+/* Set if an explicit datapath drop action shall be added after trailing sample
+ * actions coming from IPFIX / sFlow / local sampling. */
+void
+ofproto_set_explicit_sampled_drops(bool explicit_sampled_drops)
+{
+    ofproto_explicit_sampled_drops = explicit_sampled_drops;
+}
+
 /* If forward_bpdu is true, the NORMAL action will forward frames with
  * reserved (e.g. STP) destination Ethernet addresses. if forward_bpdu is false,
  * the NORMAL action will drop these frames. */
@@ -800,7 +809,7 @@ ofproto_type_set_config(const char *datapath_type, const struct smap *cfg)
     datapath_type = ofproto_normalize_type(datapath_type);
     class = ofproto_class_find__(datapath_type);
 
-    if (class->type_set_config) {
+    if (class && class->type_set_config) {
         class->type_set_config(datapath_type, cfg);
     }
 }
@@ -1000,6 +1009,18 @@ ofproto_get_datapath_cap(const char *datapath_type, struct smap *dp_cap)
     }
 }
 
+int ofproto_set_local_sample(struct ofproto *ofproto,
+                             const struct ofproto_lsample_options *options,
+                             size_t n_options)
+{
+    if (ofproto->ofproto_class->set_local_sample) {
+        return ofproto->ofproto_class->set_local_sample(ofproto, options,
+                                                        n_options);
+    } else {
+        return EOPNOTSUPP;
+    }
+}
+
 /* Connection tracking configuration. */
 void
 ofproto_ct_set_zone_timeout_policy(const char *datapath_type, uint16_t zone_id,
@@ -1026,6 +1047,29 @@ ofproto_ct_del_zone_timeout_policy(const char *datapath_type, uint16_t zone_id)
 
 }
 
+void
+ofproto_ct_zone_limit_update(const char *datapath_type, int32_t zone_id,
+                             int64_t *limit)
+{
+    datapath_type = ofproto_normalize_type(datapath_type);
+    const struct ofproto_class *class = ofproto_class_find__(datapath_type);
+
+    if (class && class->ct_zone_limit_update) {
+        class->ct_zone_limit_update(datapath_type, zone_id, limit);
+    }
+}
+
+void
+ofproto_ct_zone_limit_protection_update(const char *datapath_type,
+                                        bool protected)
+{
+    datapath_type = ofproto_normalize_type(datapath_type);
+    const struct ofproto_class *class = ofproto_class_find__(datapath_type);
+
+    if (class && class->ct_zone_limit_protection_update) {
+        class->ct_zone_limit_protection_update(datapath_type, protected);
+    }
+}
 
 /* Spanning Tree Protocol (STP) configuration. */
 
@@ -4821,9 +4865,9 @@ handle_flow_stats_request(struct ofconn *ofconn,
     return 0;
 }
 
-static void
-flow_stats_ds(struct ofproto *ofproto, struct rule *rule, struct ds *results,
-              bool offload_stats)
+void
+ofproto_rule_stats_ds(struct ds *results, struct rule *rule,
+                      bool offload_stats)
 {
     struct pkt_stats stats;
     const struct rule_actions *actions;
@@ -4852,7 +4896,8 @@ flow_stats_ds(struct ofproto *ofproto, struct rule *rule, struct ds *results,
         ds_put_format(results, "n_offload_bytes=%"PRIu64", ",
                       stats.n_offload_bytes);
     }
-    cls_rule_format(&rule->cr, ofproto_get_tun_tab(ofproto), NULL, results);
+    cls_rule_format(&rule->cr, ofproto_get_tun_tab(rule->ofproto), NULL,
+                    results);
     ds_put_char(results, ',');
 
     ds_put_cstr(results, "actions=");
@@ -4874,7 +4919,7 @@ ofproto_get_all_flows(struct ofproto *p, struct ds *results,
         struct rule *rule;
 
         CLS_FOR_EACH (rule, cr, &table->cls) {
-            flow_stats_ds(p, rule, results, offload_stats);
+            ofproto_rule_stats_ds(results, rule, offload_stats);
         }
     }
 }
@@ -8180,6 +8225,9 @@ ofproto_flow_mod_init(struct ofproto *ofproto, struct ofproto_flow_mod *ofm,
     ofm->conjs = NULL;
     ofm->n_conjs = 0;
     ofm->table_id = fm->table_id;
+
+    /* Initialize flag used by ofproto_dpif_xcache_execute(). */
+    ofm->learn_adds_rule = false;
 
     bool check_buffer_id = false;
 

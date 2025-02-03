@@ -103,7 +103,7 @@ vSwitch with AF_XDP will require the following:
 
   * CONFIG_BPF_JIT=y (Performance)
 
-  * CONFIG_HAVE_BPF_JIT=y (Performance)
+  * CONFIG_HAVE_EBPF_JIT=y (Performance)
 
   * CONFIG_XDP_SOCKETS_DIAG=y (Debugging)
 
@@ -150,7 +150,7 @@ To kick start end-to-end autotesting::
   make check-afxdp TESTSUITEFLAGS='1'
 
 .. note::
-   Not all test cases pass at this time. Currenly all cvlan tests are skipped
+   Not all test cases pass at this time. Currently all cvlan tests are skipped
    due to kernel issues.
 
 If a test case fails, check the log at::
@@ -219,14 +219,10 @@ Otherwise, enable debugging by::
   ovs-appctl vlog/set netdev_afxdp::dbg
 
 To check which XDP mode was chosen by ``best-effort``, you can look for
-``xdp-mode-in-use`` in the output of ``ovs-appctl dpctl/show``::
+``xdp-mode`` in the output of ``ovs-vsctl get interface INT status:xdp-mode``::
 
-  # ovs-appctl dpctl/show
-  netdev@ovs-netdev:
-    <...>
-    port 2: ens802f0 (afxdp: n_rxq=1, use-need-wakeup=true,
-                      xdp-mode=best-effort,
-                      xdp-mode-in-use=native-with-zerocopy)
+  # ovs-vsctl get interface ens802f0 status:xdp-mode
+  "native-with-zerocopy"
 
 References
 ----------

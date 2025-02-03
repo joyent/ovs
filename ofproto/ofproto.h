@@ -103,6 +103,11 @@ struct ofproto_ipfix_flow_exporter_options {
     char *virtual_obs_id;
 };
 
+struct ofproto_lsample_options {
+    uint32_t collector_set_id;
+    uint32_t group_id;
+};
+
 struct ofproto_rstp_status {
     bool enabled;               /* If false, ignore other members. */
     rstp_identifier root_id;
@@ -321,6 +326,7 @@ int ofproto_port_dump_done(struct ofproto_port_dump *);
 #define OFPROTO_MAX_REVALIDATOR_DEFAULT 500 /* ms */
 #define OFPROTO_MIN_REVALIDATE_PPS_DEFAULT 5
 #define OFPROTO_OFFLOADED_STATS_DELAY 2000 /* ms */
+#define OFPROTO_EXPLICIT_SAMPLED_DROPS_DEFAULT false
 
 const char *ofproto_port_open_type(const struct ofproto *,
                                    const char *port_type);
@@ -371,6 +377,9 @@ int ofproto_set_ipfix(struct ofproto *,
                       const struct ofproto_ipfix_bridge_exporter_options *,
                       const struct ofproto_ipfix_flow_exporter_options *,
                       size_t);
+int ofproto_set_local_sample(struct ofproto *ofproto,
+                             const struct ofproto_lsample_options *,
+                             size_t n_options);
 void ofproto_set_flow_restore_wait(bool flow_restore_wait_db);
 bool ofproto_get_flow_restore_wait(void);
 int ofproto_set_stp(struct ofproto *, const struct ofproto_stp_settings *);
@@ -384,8 +393,13 @@ void ofproto_ct_set_zone_timeout_policy(const char *datapath_type,
                                         struct simap *timeout_policy);
 void ofproto_ct_del_zone_timeout_policy(const char *datapath_type,
                                         uint16_t zone);
+void ofproto_ct_zone_limit_update(const char *datapath_type, int32_t zone_id,
+                                  int64_t *limit);
+void ofproto_ct_zone_limit_protection_update(const char *datapath_type,
+                                             bool protected);
 void ofproto_get_datapath_cap(const char *datapath_type,
                               struct smap *dp_cap);
+void ofproto_set_explicit_sampled_drops(bool explicit_sampled_drops);
 
 /* Configuration of ports. */
 void ofproto_port_unregister(struct ofproto *, ofp_port_t ofp_port);
@@ -497,6 +511,9 @@ struct ofproto_mirror_settings {
     uint16_t out_vlan;          /* Output VLAN, only if out_bundle is NULL. */
     uint16_t snaplen;           /* Max packet size of a mirrored packet
                                    in byte, set to 0 equals 65535. */
+
+    /* Output filter. */
+    char *filter;
 };
 
 int ofproto_mirror_register(struct ofproto *, void *aux,
@@ -545,7 +562,7 @@ struct ofproto_table_settings {
     enum mf_field_id prefix_fields[CLS_MAX_TRIES];
 };
 
-extern const enum mf_field_id default_prefix_fields[2];
+extern const enum mf_field_id default_prefix_fields[4];
 BUILD_ASSERT_DECL(ARRAY_SIZE(default_prefix_fields) <= CLS_MAX_TRIES);
 
 int ofproto_get_n_tables(const struct ofproto *);

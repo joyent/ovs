@@ -23,24 +23,16 @@ except ImportError:  # Needed for setuptools < 59.0
 
 import setuptools
 
-VERSION = "unknown"
+VERSION = "@VERSION@"
 
-try:
-    # Try to set the version from the generated ovs/version.py
-    exec(open("ovs/version.py").read())
-except IOError:
-    print("Ensure version.py is created by running make python/ovs/version.py",
-          file=sys.stderr)
-    sys.exit(-1)
-
-try:
-    # Try to open generated ovs/dirs.py. However, in this case we
-    # don't need to exec()
-    open("ovs/dirs.py")
-except IOError:
-    print("Ensure dirs.py is created by running make python/ovs/dirs.py",
-          file=sys.stderr)
-    sys.exit(-1)
+for x in ("version.py", "dirs.py"):
+    try:
+        # Try to open generated ovs/{version,dirs}.py
+        open(f"ovs/{x}")
+    except IOError:
+        print(f"Ensure {x} is created by running make python/ovs/{x}",
+              file=sys.stderr)
+        sys.exit(-1)
 
 ext_errors = (CCompilerError, ExecError, PlatformError)
 if sys.platform == 'win32':
@@ -80,6 +72,7 @@ else:
 extra_cflags = os.environ.get('extra_cflags', '').split()
 extra_libs = os.environ.get('extra_libs', '').split()
 
+flow_extras_require = ['netaddr', 'pyparsing']
 
 setup_args = dict(
     name='ovs',
@@ -89,7 +82,8 @@ setup_args = dict(
     author='Open vSwitch',
     author_email='dev@openvswitch.org',
     packages=['ovs', 'ovs.compat', 'ovs.compat.sortedcontainers',
-              'ovs.db', 'ovs.unixctl', 'ovs.flow'],
+              'ovs.db', 'ovs.flow', 'ovs.flowviz', 'ovs.flowviz.odp',
+              'ovs.flowviz.ofp', 'ovs.unixctl'],
     keywords=['openvswitch', 'ovs', 'OVSDB'],
     license='Apache 2.0',
     classifiers=[
@@ -99,7 +93,7 @@ setup_args = dict(
         'Topic :: System :: Networking',
         'License :: OSI Approved :: Apache Software License',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.6',
+        'Programming Language :: Python :: 3.7',
     ],
     ext_modules=[setuptools.Extension("ovs._json",
                                       sources=["ovs/_json.c"],
@@ -109,8 +103,13 @@ setup_args = dict(
     cmdclass={'build_ext': try_build_ext},
     install_requires=['sortedcontainers'],
     extras_require={':sys_platform == "win32"': ['pywin32 >= 1.0'],
-                    'flow': ['netaddr', 'pyparsing'],
-                    'dns': ['unbound']},
+                    'dns': ['unbound'],
+                    'flow': flow_extras_require,
+                    'flowviz':
+                        [*flow_extras_require, 'click', 'rich', 'graphviz'],
+                    },
+    scripts=["ovs/flowviz/ovs-flowviz"],
+    package_data={'ovs.flowviz': ['ovs-flowviz.conf']},
 )
 
 try:

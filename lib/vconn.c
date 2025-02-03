@@ -143,7 +143,7 @@ vconn_usage(bool active, bool passive, bool bootstrap OVS_UNUSED)
                "PORT (default: %d) at remote HOST\n", OFP_PORT);
 #ifdef HAVE_OPENSSL
         printf("  ssl:HOST[:PORT]         "
-               "SSL PORT (default: %d) at remote HOST\n", OFP_PORT);
+               "SSL/TLS PORT (default: %d) at remote HOST\n", OFP_PORT);
 #endif
         printf("  unix:FILE               Unix domain socket named FILE\n");
     }
@@ -155,7 +155,7 @@ vconn_usage(bool active, bool passive, bool bootstrap OVS_UNUSED)
                OFP_PORT);
 #ifdef HAVE_OPENSSL
         printf("  pssl:[PORT][:IP]        "
-               "listen for SSL on PORT (default: %d) on IP\n",
+               "listen for SSL/TLS on PORT (default: %d) on IP\n",
                OFP_PORT);
 #endif
         printf("  punix:FILE              "
@@ -163,7 +163,7 @@ vconn_usage(bool active, bool passive, bool bootstrap OVS_UNUSED)
     }
 
 #ifdef HAVE_OPENSSL
-    printf("PKI configuration (required to use SSL):\n"
+    printf("PKI configuration (required to use SSL/TLS):\n"
            "  -p, --private-key=FILE  file with private key\n"
            "  -c, --certificate=FILE  file with certificate for private key\n"
            "  -C, --ca-cert=FILE      file with peer CA certificate\n");
@@ -682,7 +682,6 @@ do_send(struct vconn *vconn, struct ofpbuf *msg)
 
     ofpmsg_update_length(msg);
     if (!VLOG_IS_DBG_ENABLED()) {
-        COVERAGE_INC(vconn_sent);
         retval = (vconn->vclass->send)(vconn, msg);
     } else {
         char *s = ofp_to_string(msg->data, msg->size, NULL, NULL, 1);
@@ -692,6 +691,9 @@ do_send(struct vconn *vconn, struct ofpbuf *msg)
                         vconn->name, ovs_strerror(retval), s);
         }
         free(s);
+    }
+    if (!retval) {
+        COVERAGE_INC(vconn_sent);
     }
     return retval;
 }
@@ -1015,6 +1017,8 @@ recv_flow_stats_reply(struct vconn *vconn, ovs_be32 send_xid,
                 VLOG_WARN_RL(&rl, "received bad reply: %s",
                              ofp_to_string(reply->data, reply->size,
                                            NULL, NULL, 1));
+                ofpbuf_delete(reply);
+                *replyp = NULL;
                 return EPROTO;
             }
         }
@@ -1029,9 +1033,9 @@ recv_flow_stats_reply(struct vconn *vconn, ovs_be32 send_xid,
         case EOF:
             more = ofpmp_more(reply->header);
             ofpbuf_delete(reply);
+            *replyp = NULL;
             reply = NULL;
             if (!more) {
-                *replyp = NULL;
                 return EOF;
             }
             break;
@@ -1039,6 +1043,8 @@ recv_flow_stats_reply(struct vconn *vconn, ovs_be32 send_xid,
         default:
             VLOG_WARN_RL(&rl, "parse error in reply (%s)",
                          ofperr_to_string(retval));
+            ofpbuf_delete(reply);
+            *replyp = NULL;
             return EPROTO;
         }
     }

@@ -280,10 +280,10 @@ AC_DEFUN([OVS_CHECK_OPENSSL],
 
 $SSL_PKG_ERRORS
 
-OpenFlow connections over SSL will not be supported.
+OpenFlow connections over SSL/TLS will not be supported.
 (You may use --disable-ssl to suppress this warning.)])
           else
-            AC_MSG_ERROR([Cannot find openssl (use --disable-ssl to configure without SSL support)])
+            AC_MSG_ERROR([Cannot find openssl (use --disable-ssl to configure without SSL/TLS support)])
           fi])
    else
        HAVE_OPENSSL=no
@@ -293,22 +293,6 @@ OpenFlow connections over SSL will not be supported.
    if test "$HAVE_OPENSSL" = yes; then
       AC_DEFINE([HAVE_OPENSSL], [1], [Define to 1 if OpenSSL is installed.])
    fi
-
-   OPENSSL_SUPPORTS_SNI=no
-   if test $HAVE_OPENSSL = yes; then
-      save_CPPFLAGS=$CPPFLAGS
-      CPPFLAGS="$CPPFLAGS $SSL_INCLUDES"
-      AC_CHECK_DECL([SSL_set_tlsext_host_name], [OPENSSL_SUPPORTS_SNI=yes],
-                    [], [#include <openssl/ssl.h>
-])
-      if test $OPENSSL_SUPPORTS_SNI = yes; then
-        AC_DEFINE(
-          [OPENSSL_SUPPORTS_SNI], [1],
-          [Define to 1 if OpenSSL supports Server Name Indication (SNI).])
-      fi
-      CPPFLAGS=$save_CPPFLAGS
-   fi
-   AC_SUBST([OPENSSL_SUPPORTS_SNI])
 ])
 
 dnl Checks for libraries needed by lib/socket-util.c.
@@ -375,22 +359,22 @@ dnl Checks for valgrind/valgrind.h.
 AC_DEFUN([OVS_CHECK_VALGRIND],
   [AC_CHECK_HEADERS([valgrind/valgrind.h])])
 
-dnl Checks for Python 3.6 or later.
+dnl Checks for Python 3.7 or later.
 AC_DEFUN([OVS_CHECK_PYTHON3],
   [AC_CACHE_CHECK(
-     [for Python 3 (version 3.6 or later)],
+     [for Python 3 (version 3.7 or later)],
      [ovs_cv_python3],
      [if test -n "$PYTHON3"; then
         ovs_cv_python3=$PYTHON3
       else
         ovs_cv_python3=no
-        for binary in python3 python3.6 python3.7 python3.8 python3.9 python3.10 python3.11 python3.12; do
+        for binary in python3 python3.7 python3.8 python3.9 python3.10 python3.11 python3.12 python3.13; do
           ovs_save_IFS=$IFS; IFS=$PATH_SEPARATOR
           for dir in $PATH; do
             IFS=$ovs_save_IFS
             test -z "$dir" && dir=.
             if test -x "$dir"/"$binary" && "$dir"/"$binary" -c 'import sys
-if sys.hexversion >= 0x03040000 and sys.hexversion < 0x04000000:
+if sys.hexversion >= 0x03070000 and sys.hexversion < 0x04000000:
     sys.exit(0)
 else:
     sys.exit(1)'; then
@@ -401,7 +385,7 @@ else:
         done
       fi])
    if test "$ovs_cv_python3" = no; then
-     AC_MSG_ERROR([Python 3.6 or later is required but not found in $PATH, please install it or set $PYTHON3 to point to it])
+     AC_MSG_ERROR([Python 3.7 or later is required but not found in $PATH, please install it or set $PYTHON3 to point to it])
    fi
    AC_ARG_VAR([PYTHON3])
    PYTHON3=$ovs_cv_python3])

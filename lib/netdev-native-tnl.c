@@ -43,6 +43,7 @@
 #include "seq.h"
 #include "unaligned.h"
 #include "unixctl.h"
+#include "util.h"
 #include "openvswitch/vlog.h"
 
 VLOG_DEFINE_THIS_MODULE(native_tnl);
@@ -59,6 +60,27 @@ static struct vlog_rate_limit err_rl = VLOG_RATE_LIMIT_INIT(60, 5);
 
 uint16_t tnl_udp_port_min = 32768;
 uint16_t tnl_udp_port_max = 61000;
+
+ovs_be16
+netdev_tnl_get_src_port(struct dp_packet *packet)
+{
+    uint32_t hash;
+
+    if (OVS_LIKELY(dp_packet_rss_valid(packet))) {
+        hash = dp_packet_get_rss_hash(packet);
+    } else {
+        struct flow flow;
+
+        flow_extract(packet, &flow);
+        hash = flow_hash_5tuple(&flow, 0);
+
+        dp_packet_set_rss_hash(packet, hash);
+    }
+
+    hash = ((uint64_t) hash * (tnl_udp_port_max - tnl_udp_port_min)) >> 32;
+
+    return htons(hash + tnl_udp_port_min);
+}
 
 void *
 netdev_tnl_ip_extract_tnl_md(struct dp_packet *packet, struct flow_tnl *tnl,
@@ -90,8 +112,7 @@ netdev_tnl_ip_extract_tnl_md(struct dp_packet *packet, struct flow_tnl *tnl,
 
         /* A packet coming from a network device might have the
          * csum already checked. In this case, skip the check. */
-        if (OVS_UNLIKELY(!dp_packet_ip_checksum_good(packet))
-            && !dp_packet_hwol_tx_ip_csum(packet)) {
+        if (OVS_UNLIKELY(!dp_packet_hwol_l3_csum_ipv4_ol(packet))) {
             if (csum(ip, IP_IHL(ip->ip_ihl_ver) * 4)) {
                 VLOG_WARN_RL(&err_rl, "ip packet has invalid checksum");
                 return NULL;
@@ -172,15 +193,27 @@ netdev_tnl_push_ip_header(struct dp_packet *packet, const void *header,
         ip6->ip6_plen = htons(*ip_tot_size);
         packet_set_ipv6_flow_label(&ip6->ip6_flow, ipv6_label);
         packet->l4_ofs = dp_packet_size(packet) - *ip_tot_size;
-        dp_packet_hwol_set_tx_ipv6(packet);
+
+        if (dp_packet_hwol_is_tunnel(packet)) {
+            dp_packet_hwol_set_tx_outer_ipv6(packet);
+        } else {
+            dp_packet_hwol_set_tx_ipv6(packet);
+        }
+
         dp_packet_ol_reset_ip_csum_good(packet);
         return ip6 + 1;
     } else {
         ip = netdev_tnl_ip_hdr(eth);
         ip->ip_tot_len = htons(*ip_tot_size);
         /* Postpone checksum to when the packet is pushed to the port. */
-        dp_packet_hwol_set_tx_ipv4(packet);
-        dp_packet_hwol_set_tx_ip_csum(packet);
+        if (dp_packet_hwol_is_tunnel(packet)) {
+            dp_packet_hwol_set_tx_outer_ipv4(packet);
+            dp_packet_hwol_set_tx_outer_ipv4_csum(packet);
+        } else {
+            dp_packet_hwol_set_tx_ipv4(packet);
+            dp_packet_hwol_set_tx_ip_csum(packet);
+        }
+
         dp_packet_ol_reset_ip_csum_good(packet);
         *ip_tot_size -= IP_HEADER_LEN;
         packet->l4_ofs = dp_packet_size(packet) - *ip_tot_size;
@@ -200,7 +233,8 @@ udp_extract_tnl_md(struct dp_packet *packet, struct flow_tnl *tnl,
     }
 
     if (udp->udp_csum) {
-        if (OVS_UNLIKELY(!dp_packet_l4_checksum_good(packet))) {
+        if (OVS_LIKELY(!dp_packet_ol_l4_csum_partial(packet)) &&
+            OVS_UNLIKELY(!dp_packet_l4_checksum_good(packet))) {
             uint32_t csum;
             if (netdev_tnl_is_header_ipv6(dp_packet_data(packet))) {
                 csum = packet_csum_pseudoheader6(dp_packet_l3(packet));
@@ -225,27 +259,82 @@ udp_extract_tnl_md(struct dp_packet *packet, struct flow_tnl *tnl,
     return udp + 1;
 }
 
+static void
+dp_packet_tnl_ol_process(struct dp_packet *packet,
+                         const struct ovs_action_push_tnl *data)
+{
+    struct ip_header *ip = NULL;
+
+    if (dp_packet_hwol_l4_mask(packet)) {
+        ip = dp_packet_l3(packet);
+
+        if (data->tnl_type == OVS_VPORT_TYPE_GENEVE ||
+            data->tnl_type == OVS_VPORT_TYPE_VXLAN ||
+            data->tnl_type == OVS_VPORT_TYPE_GRE ||
+            data->tnl_type == OVS_VPORT_TYPE_IP6GRE) {
+
+            if (IP_VER(ip->ip_ihl_ver) == 4) {
+                dp_packet_hwol_set_tx_ipv4(packet);
+                dp_packet_hwol_set_tx_ip_csum(packet);
+            } else if (IP_VER(ip->ip_ihl_ver) == 6) {
+                dp_packet_hwol_set_tx_ipv6(packet);
+            }
+        }
+    }
+
+    if (data->tnl_type == OVS_VPORT_TYPE_GENEVE) {
+        dp_packet_hwol_set_tunnel_geneve(packet);
+    } else if (data->tnl_type == OVS_VPORT_TYPE_VXLAN) {
+        dp_packet_hwol_set_tunnel_vxlan(packet);
+    } else if (data->tnl_type == OVS_VPORT_TYPE_GRE ||
+               data->tnl_type == OVS_VPORT_TYPE_IP6GRE) {
+        dp_packet_hwol_set_tunnel_gre(packet);
+    }
+}
+
 void
 netdev_tnl_push_udp_header(const struct netdev *netdev OVS_UNUSED,
                            struct dp_packet *packet,
                            const struct ovs_action_push_tnl *data)
 {
+    uint16_t l3_ofs = packet->l3_ofs;
+    uint16_t l4_ofs = packet->l4_ofs;
     struct udp_header *udp;
+    ovs_be16 udp_src;
     int ip_tot_size;
 
+    /* We may need to re-calculate the hash and this has to be done before
+     * modifying the packet. */
+    udp_src = netdev_tnl_get_src_port(packet);
+
+    dp_packet_tnl_ol_process(packet, data);
     udp = netdev_tnl_push_ip_header(packet, data->header, data->header_len,
                                     &ip_tot_size, 0);
 
-    /* set udp src port */
-    udp->udp_src = netdev_tnl_get_src_port(packet);
+    udp->udp_src = udp_src;
     udp->udp_len = htons(ip_tot_size);
 
-    /* Postpone checksum to the egress netdev. */
-    dp_packet_hwol_set_csum_udp(packet);
     if (udp->udp_csum) {
         dp_packet_ol_reset_l4_csum_good(packet);
-    } else {
+        if (dp_packet_hwol_is_tunnel_geneve(packet) ||
+            dp_packet_hwol_is_tunnel_vxlan(packet)) {
+            dp_packet_hwol_set_outer_udp_csum(packet);
+        } else {
+            dp_packet_hwol_set_csum_udp(packet);
+        }
+    }
+
+    if (packet->csum_start && packet->csum_offset) {
+        dp_packet_ol_set_l4_csum_partial(packet);
+    } else if (!udp->udp_csum) {
         dp_packet_ol_set_l4_csum_good(packet);
+    }
+
+    if (l3_ofs != UINT16_MAX) {
+        packet->inner_l3_ofs = l3_ofs + data->header_len;
+    }
+    if (l4_ofs != UINT16_MAX) {
+        packet->inner_l4_ofs = l4_ofs + data->header_len;
     }
 }
 
@@ -323,7 +412,7 @@ udp_build_header(const struct netdev_tunnel_config *tnl_cfg,
     udp = netdev_tnl_ip_build_header(data, params, IPPROTO_UDP, 0);
     udp->udp_dst = tnl_cfg->dst_port;
 
-    if (params->is_ipv6 || params->flow->tunnel.flags & FLOW_TNL_F_CSUM) {
+    if (params->flow->tunnel.flags & FLOW_TNL_F_CSUM) {
         /* Write a value in now to mark that we should compute the checksum
          * later. 0xffff is handy because it is transparent to the
          * calculation. */
@@ -415,11 +504,14 @@ parse_gre_header(struct dp_packet *packet,
 struct dp_packet *
 netdev_gre_pop_header(struct dp_packet *packet)
 {
+    const void *data_dp = dp_packet_data(packet);
     struct pkt_metadata *md = &packet->md;
     struct flow_tnl *tnl = &md->tunnel;
     int hlen = sizeof(struct eth_header) + 4;
 
-    hlen += netdev_tnl_is_header_ipv6(dp_packet_data(packet)) ?
+    ovs_assert(data_dp);
+
+    hlen += netdev_tnl_is_header_ipv6(data_dp) ?
             IPV6_HEADER_LEN : IP_HEADER_LEN;
 
     pkt_metadata_init_tnl(md);
@@ -446,8 +538,12 @@ netdev_gre_push_header(const struct netdev *netdev,
                        const struct ovs_action_push_tnl *data)
 {
     struct netdev_vport *dev = netdev_vport_cast(netdev);
+    uint16_t l3_ofs = packet->l3_ofs;
+    uint16_t l4_ofs = packet->l4_ofs;
     struct gre_base_hdr *greh;
     int ip_tot_size;
+
+    dp_packet_tnl_ol_process(packet, data);
 
     greh = netdev_tnl_push_ip_header(packet, data->header, data->header_len,
                                      &ip_tot_size, 0);
@@ -458,11 +554,24 @@ netdev_gre_push_header(const struct netdev *netdev,
     }
 
     if (greh->flags & htons(GRE_SEQ)) {
-        /* Last 4 byte is GRE seqno */
-        int seq_ofs = gre_header_len(greh->flags) - 4;
-        ovs_16aligned_be32 *seq_opt =
-            ALIGNED_CAST(ovs_16aligned_be32 *, (char *)greh + seq_ofs);
-        put_16aligned_be32(seq_opt, htonl(atomic_count_inc(&dev->gre_seqno)));
+        if (!dp_packet_hwol_is_tso(packet)) {
+            /* Last 4 bytes are GRE seqno. */
+            int seq_ofs = gre_header_len(greh->flags) - 4;
+            ovs_16aligned_be32 *seq_opt =
+                ALIGNED_CAST(ovs_16aligned_be32 *, (char *) greh + seq_ofs);
+
+            put_16aligned_be32(seq_opt,
+                               htonl(atomic_count_inc(&dev->gre_seqno)));
+        } else {
+            VLOG_WARN_RL(&err_rl, "Cannot use GRE Sequence numbers with TSO.");
+        }
+    }
+
+    if (l3_ofs != UINT16_MAX) {
+        packet->inner_l3_ofs = l3_ofs + data->header_len;
+    }
+    if (l4_ofs != UINT16_MAX) {
+        packet->inner_l4_ofs = l4_ofs + data->header_len;
     }
 }
 
@@ -767,13 +876,18 @@ netdev_gtpu_push_header(const struct netdev *netdev,
     struct netdev_vport *dev = netdev_vport_cast(netdev);
     struct udp_header *udp;
     struct gtpuhdr *gtpuh;
+    ovs_be16 udp_src;
     int ip_tot_size;
     unsigned int payload_len;
+
+    /* We may need to re-calculate the hash and this has to be done before
+     * modifying the packet. */
+    udp_src = netdev_tnl_get_src_port(packet);
 
     payload_len = dp_packet_size(packet);
     udp = netdev_tnl_push_ip_header(packet, data->header, data->header_len,
                                     &ip_tot_size, 0);
-    udp->udp_src = netdev_tnl_get_src_port(packet);
+    udp->udp_src = udp_src;
     udp->udp_len = htons(ip_tot_size);
     /* Postpone checksum to the egress netdev. */
     dp_packet_hwol_set_csum_udp(packet);
@@ -828,9 +942,9 @@ netdev_srv6_build_header(const struct netdev *netdev,
                          const struct netdev_tnl_build_header_params *params)
 {
     const struct netdev_tunnel_config *tnl_cfg;
+    union ovs_16aligned_in6_addr *s;
     const struct in6_addr *segs;
     struct srv6_base_hdr *srh;
-    struct in6_addr *s;
     ovs_be16 dl_type;
     int nr_segs;
     int i;
@@ -874,8 +988,7 @@ netdev_srv6_build_header(const struct netdev *netdev,
         return EOPNOTSUPP;
     }
 
-    s = ALIGNED_CAST(struct in6_addr *,
-                     (char *) srh + sizeof *srh);
+    s = (union ovs_16aligned_in6_addr *) (srh + 1);
     for (i = 0; i < nr_segs; i++) {
         /* Segment list is written to the header in reverse order. */
         memcpy(s, &segs[nr_segs - i - 1], sizeof *s);
@@ -927,7 +1040,6 @@ struct dp_packet *
 netdev_srv6_pop_header(struct dp_packet *packet)
 {
     const struct ovs_16aligned_ip6_hdr *nh = dp_packet_l3(packet);
-    size_t size = dp_packet_l3_size(packet) - IPV6_HEADER_LEN;
     struct pkt_metadata *md = &packet->md;
     struct flow_tnl *tnl = &md->tunnel;
     const struct ip6_rt_hdr *rt_hdr;
@@ -935,11 +1047,18 @@ netdev_srv6_pop_header(struct dp_packet *packet)
     const void *data = nh + 1;
     uint8_t nw_frag = 0;
     unsigned int hlen;
+    size_t size;
 
     /*
      * Verifies that the routing header is present in the IPv6
      * extension headers and that its type is SRv6.
      */
+    size = dp_packet_l3_size(packet);
+    if (size < IPV6_HEADER_LEN) {
+        goto err;
+    }
+    size -= IPV6_HEADER_LEN;
+
     if (!parse_ipv6_ext_hdrs(&data, &size, &nw_proto, &nw_frag,
                              NULL, &rt_hdr)) {
         goto err;
@@ -964,7 +1083,10 @@ netdev_srv6_pop_header(struct dp_packet *packet)
     }
 
     pkt_metadata_init_tnl(md);
-    netdev_tnl_ip_extract_tnl_md(packet, tnl, &hlen);
+    if (!netdev_tnl_ip_extract_tnl_md(packet, tnl, &hlen)) {
+        goto err;
+    }
+
     dp_packet_reset_packet(packet, hlen);
 
     return packet;

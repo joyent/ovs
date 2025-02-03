@@ -99,7 +99,7 @@ VLOG_DEFINE_THIS_MODULE(dpif_netdev);
 
 #define FLOW_DUMP_MAX_BATCH 50
 /* Use per thread recirc_depth to prevent recirculation loop. */
-#define MAX_RECIRC_DEPTH 6
+#define MAX_RECIRC_DEPTH 8
 DEFINE_STATIC_PER_THREAD_DATA(uint32_t, recirc_depth, 0)
 
 /* Use instant packet send by default. */
@@ -115,6 +115,7 @@ COVERAGE_DEFINE(datapath_drop_lock_error);
 COVERAGE_DEFINE(datapath_drop_userspace_action_error);
 COVERAGE_DEFINE(datapath_drop_tunnel_push_error);
 COVERAGE_DEFINE(datapath_drop_tunnel_pop_error);
+COVERAGE_DEFINE(datapath_drop_tunnel_tso_recirc);
 COVERAGE_DEFINE(datapath_drop_recirc_error);
 COVERAGE_DEFINE(datapath_drop_invalid_port);
 COVERAGE_DEFINE(datapath_drop_invalid_bond);
@@ -178,6 +179,11 @@ static struct odp_support dp_netdev_support = {
 #define PMD_SLEEP_THRESH (NETDEV_MAX_BURST / 2)
 /* Time in uS to increment a pmd thread sleep time. */
 #define PMD_SLEEP_INC_US 1
+
+struct pmd_sleep {
+    unsigned core_id;
+    uint64_t max_sleep;
+};
 
 struct dpcls {
     struct cmap_node node;      /* Within dp_netdev_pmd_thread.classifiers */
@@ -287,8 +293,8 @@ struct dp_netdev {
     atomic_uint32_t emc_insert_min;
     /* Enable collection of PMD performance metrics. */
     atomic_bool pmd_perf_metrics;
-    /* Max load based sleep request. */
-    atomic_uint64_t pmd_max_sleep;
+    /* Default max load based sleep request. */
+    uint64_t pmd_max_sleep_default;
     /* Enable the SMC cache from ovsdb config */
     atomic_bool smc_enable_db;
 
@@ -325,6 +331,9 @@ struct dp_netdev {
 
     /* Cpu mask for pin of pmd threads. */
     char *pmd_cmask;
+
+    /* PMD max load based sleep request user string. */
+    char *max_sleep_list;
 
     uint64_t last_tnl_conf_seq;
 
@@ -933,9 +942,9 @@ pmd_info_show_rxq(struct ds *reply, struct dp_netdev_pmd_thread *pmd,
                                         ? "(enabled) " : "(disabled)");
             ds_put_format(reply, "  pmd usage: ");
             if (total_pmd_cycles) {
-                ds_put_format(reply, "%2"PRIu64"",
-                              rxq_proc_cycles * 100 / total_pmd_cycles);
-                ds_put_cstr(reply, " %");
+                ds_put_format(reply, "%2.0f %%",
+                              (double) (rxq_proc_cycles * 100) /
+                              total_pmd_cycles);
             } else {
                 ds_put_format(reply, "%s", "NOT AVAIL");
             }
@@ -950,8 +959,10 @@ pmd_info_show_rxq(struct ds *reply, struct dp_netdev_pmd_thread *pmd,
                 if (total_rxq_proc_cycles < busy_pmd_cycles) {
                     overhead_cycles = busy_pmd_cycles - total_rxq_proc_cycles;
                 }
-                ds_put_format(reply, "%2"PRIu64" %%",
-                              overhead_cycles * 100 / total_pmd_cycles);
+
+                ds_put_format(reply, "%2.0f %%",
+                              (double) (overhead_cycles * 100) /
+                              total_pmd_cycles);
             } else {
                 ds_put_cstr(reply, "NOT AVAIL");
             }
@@ -1429,6 +1440,19 @@ dpif_netdev_pmd_rebalance(struct unixctl_conn *conn, int argc,
 }
 
 static void
+pmd_info_show_sleep(struct ds *reply, unsigned core_id, int numa_id,
+                    uint64_t pmd_max_sleep)
+{
+    if (core_id == NON_PMD_CORE_ID) {
+        return;
+    }
+    ds_put_format(reply,
+                  "pmd thread numa_id %d core_id %d:\n"
+                  "  max sleep: %4"PRIu64" us\n",
+                  numa_id, core_id, pmd_max_sleep);
+}
+
+static void
 dpif_netdev_pmd_info(struct unixctl_conn *conn, int argc, const char *argv[],
                      void *aux)
 {
@@ -1442,9 +1466,8 @@ dpif_netdev_pmd_info(struct unixctl_conn *conn, int argc, const char *argv[],
     unsigned int secs = 0;
     unsigned long long max_secs = (PMD_INTERVAL_LEN * PMD_INTERVAL_MAX)
                                       / INTERVAL_USEC_TO_SEC;
-    uint64_t default_max_sleep = 0;
     bool show_header = true;
-
+    uint64_t max_sleep;
 
     ovs_mutex_lock(&dp_netdev_mutex);
 
@@ -1512,12 +1535,13 @@ dpif_netdev_pmd_info(struct unixctl_conn *conn, int argc, const char *argv[],
             pmd_info_show_perf(&reply, pmd, (struct pmd_perf_params *)aux);
         } else if (type == PMD_INFO_SLEEP_SHOW) {
             if (show_header) {
-                atomic_read_relaxed(&dp->pmd_max_sleep, &default_max_sleep);
-                ds_put_format(&reply, "Default max sleep: %4"PRIu64" us",
-                              default_max_sleep);
-                ds_put_cstr(&reply, "\n");
+                ds_put_format(&reply, "Default max sleep: %4"PRIu64" us\n",
+                              dp->pmd_max_sleep_default);
                 show_header = false;
             }
+            atomic_read_relaxed(&pmd->max_sleep, &max_sleep);
+            pmd_info_show_sleep(&reply, pmd->core_id, pmd->numa_id,
+                                max_sleep);
         }
     }
     free(pmd_list);
@@ -1906,6 +1930,8 @@ create_dp_netdev(const char *name, const struct dpif_class *class,
         return error;
     }
 
+    dp->max_sleep_list = NULL;
+
     dp->last_tnl_conf_seq = seq_read(tnl_conf_seq);
     *dpp = dp;
     return 0;
@@ -2015,6 +2041,7 @@ dp_netdev_free(struct dp_netdev *dp)
 
     dp_netdev_meter_destroy(dp);
 
+    free(dp->max_sleep_list);
     free(dp->pmd_cmask);
     free(CONST_CAST(char *, dp->name));
     free(dp);
@@ -3014,7 +3041,7 @@ log_netdev_flow_change(const struct dp_netdev_flow *flow,
     ds_put_cstr(&ds, " ");
     odp_flow_format(key_buf.data, key_buf.size,
                     mask_buf.data, mask_buf.size,
-                    NULL, &ds, false);
+                    NULL, &ds, false, true);
     if (old_actions) {
         ds_put_cstr(&ds, ", old_actions:");
         format_odp_actions(&ds, old_actions->actions, old_actions->size,
@@ -3834,7 +3861,7 @@ dpif_netdev_mask_from_nlattrs(const struct nlattr *key, uint32_t key_len,
 
                 ds_init(&s);
                 odp_flow_format(key, key_len, mask_key, mask_key_len, NULL, &s,
-                                true);
+                                true, true);
                 VLOG_ERR("internal error parsing flow mask %s (%s)",
                 ds_cstr(&s), odp_key_fitness_to_string(fitness));
                 ds_destroy(&s);
@@ -3863,7 +3890,7 @@ dpif_netdev_flow_from_nlattrs(const struct nlattr *key, uint32_t key_len,
                 struct ds s;
 
                 ds_init(&s);
-                odp_flow_format(key, key_len, NULL, 0, NULL, &s, true);
+                odp_flow_format(key, key_len, NULL, 0, NULL, &s, true, false);
                 VLOG_ERR("internal error parsing flow key %s", ds_cstr(&s));
                 ds_destroy(&s);
             }
@@ -4748,6 +4775,10 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
     }
 
     nb_thread = netdev_offload_thread_nb();
+    if (!nb_thread) {
+        return EINVAL;
+    }
+
     /* nb_thread counters for the overall total as well. */
     stats->size = ARRAY_SIZE(hwol_stats) * (nb_thread + 1);
     stats->counters = xcalloc(stats->size, sizeof *stats->counters);
@@ -4843,6 +4874,209 @@ set_pmd_auto_lb(struct dp_netdev *dp, bool state, bool always_log)
     }
 }
 
+static int
+parse_pmd_sleep_list(const char *max_sleep_list,
+                     struct pmd_sleep **pmd_sleeps)
+{
+    char *list, *copy, *key, *value;
+    int num_vals = 0;
+
+    if (!max_sleep_list) {
+        return num_vals;
+    }
+
+    list = copy = xstrdup(max_sleep_list);
+
+    while (ofputil_parse_key_value(&list, &key, &value)) {
+        uint64_t temp, pmd_max_sleep;
+        char *error = NULL;
+        unsigned core;
+        int i;
+
+        error = str_to_u64(key, &temp);
+        if (error) {
+            free(error);
+            continue;
+        }
+
+        if (value[0] == '\0') {
+            /* No value specified. key is dp default. */
+            core = UINT_MAX;
+            pmd_max_sleep = temp;
+        } else {
+            error = str_to_u64(value, &pmd_max_sleep);
+            if (!error && temp < UINT_MAX) {
+                /* Key is pmd core id. */
+                core = (unsigned) temp;
+            } else {
+                free(error);
+                continue;
+            }
+        }
+
+        /* Detect duplicate max sleep values. */
+        for (i = 0; i < num_vals; i++) {
+            if ((*pmd_sleeps)[i].core_id == core) {
+                break;
+            }
+        }
+        if (i == num_vals) {
+            /* Not duplicate, add a new entry. */
+            *pmd_sleeps = xrealloc(*pmd_sleeps,
+                                   (num_vals + 1) * sizeof **pmd_sleeps);
+            num_vals++;
+        }
+
+        pmd_max_sleep = MIN(PMD_RCU_QUIESCE_INTERVAL, pmd_max_sleep);
+
+        (*pmd_sleeps)[i].core_id = core;
+        (*pmd_sleeps)[i].max_sleep = pmd_max_sleep;
+    }
+
+    free(copy);
+    return num_vals;
+}
+
+static void
+log_pmd_sleep(unsigned core_id, int numa_id, uint64_t pmd_max_sleep)
+{
+    if (core_id == NON_PMD_CORE_ID) {
+        return;
+    }
+    VLOG_INFO("PMD thread on numa_id: %d, core id: %2d, "
+              "max sleep: %4"PRIu64" us.", numa_id, core_id, pmd_max_sleep);
+}
+
+static void
+pmd_init_max_sleep(struct dp_netdev *dp, struct dp_netdev_pmd_thread *pmd)
+{
+    uint64_t max_sleep = dp->pmd_max_sleep_default;
+    struct pmd_sleep *pmd_sleeps = NULL;
+    int num_vals;
+
+    num_vals = parse_pmd_sleep_list(dp->max_sleep_list, &pmd_sleeps);
+
+    /* Check if the user has set a specific value for this pmd. */
+    for (int i = 0; i < num_vals; i++) {
+        if (pmd_sleeps[i].core_id == pmd->core_id) {
+            max_sleep = pmd_sleeps[i].max_sleep;
+            break;
+        }
+    }
+    atomic_init(&pmd->max_sleep, max_sleep);
+    log_pmd_sleep(pmd->core_id, pmd->numa_id, max_sleep);
+    free(pmd_sleeps);
+}
+
+static bool
+assign_sleep_values_to_pmds(struct dp_netdev *dp, int num_vals,
+                            struct pmd_sleep *pmd_sleeps)
+{
+    struct dp_netdev_pmd_thread *pmd;
+    bool value_changed = false;
+
+    CMAP_FOR_EACH (pmd, node, &dp->poll_threads) {
+        uint64_t new_max_sleep, cur_pmd_max_sleep;
+
+        if (pmd->core_id == NON_PMD_CORE_ID) {
+            continue;
+        }
+
+        /* Default to global value. */
+        new_max_sleep = dp->pmd_max_sleep_default;
+
+        /* Check for pmd specific value. */
+        for (int i = 0;  i < num_vals; i++) {
+            if (pmd->core_id == pmd_sleeps[i].core_id) {
+                new_max_sleep = pmd_sleeps[i].max_sleep;
+                break;
+            }
+        }
+        atomic_read_relaxed(&pmd->max_sleep, &cur_pmd_max_sleep);
+        if (new_max_sleep != cur_pmd_max_sleep) {
+            atomic_store_relaxed(&pmd->max_sleep, new_max_sleep);
+            value_changed = true;
+        }
+    }
+    return value_changed;
+}
+
+static void
+log_all_pmd_sleeps(struct dp_netdev *dp)
+{
+    struct dp_netdev_pmd_thread **pmd_list = NULL;
+    struct dp_netdev_pmd_thread *pmd;
+    size_t n;
+
+    VLOG_INFO("Default PMD thread max sleep: %4"PRIu64" us.",
+              dp->pmd_max_sleep_default);
+
+    sorted_poll_thread_list(dp, &pmd_list, &n);
+
+    for (size_t i = 0; i < n; i++) {
+        uint64_t cur_pmd_max_sleep;
+
+        pmd = pmd_list[i];
+        atomic_read_relaxed(&pmd->max_sleep, &cur_pmd_max_sleep);
+        log_pmd_sleep(pmd->core_id, pmd->numa_id, cur_pmd_max_sleep);
+    }
+    free(pmd_list);
+}
+
+static bool
+set_all_pmd_max_sleeps(struct dp_netdev *dp, const struct smap *config)
+{
+    const char *max_sleep_list = smap_get(config, "pmd-sleep-max");
+    struct pmd_sleep *pmd_sleeps = NULL;
+    uint64_t default_max_sleep = 0;
+    bool default_changed = false;
+    bool pmd_changed = false;
+    uint64_t pmd_maxsleep;
+    int num_vals = 0;
+
+    /* Check for deprecated 'pmd-maxsleep' value. */
+    pmd_maxsleep = smap_get_ullong(config, "pmd-maxsleep", UINT64_MAX);
+    if (pmd_maxsleep != UINT64_MAX && !max_sleep_list) {
+        VLOG_WARN_ONCE("pmd-maxsleep is deprecated. "
+                       "Please use pmd-sleep-max instead.");
+        default_max_sleep = pmd_maxsleep;
+    }
+
+    /* Check if there is no change in string or value. */
+    if (!!dp->max_sleep_list == !!max_sleep_list) {
+        if (max_sleep_list
+            ? nullable_string_is_equal(max_sleep_list, dp->max_sleep_list)
+            : default_max_sleep == dp->pmd_max_sleep_default) {
+            return false;
+        }
+    }
+
+    /* Free existing string and copy new one (if any). */
+    free(dp->max_sleep_list);
+    dp->max_sleep_list = nullable_xstrdup(max_sleep_list);
+
+    if (max_sleep_list) {
+        num_vals = parse_pmd_sleep_list(max_sleep_list, &pmd_sleeps);
+
+        /* Check if the user has set a global value. */
+        for (int i = 0; i < num_vals; i++) {
+            if (pmd_sleeps[i].core_id == UINT_MAX) {
+                default_max_sleep = pmd_sleeps[i].max_sleep;
+                break;
+            }
+        }
+    }
+
+    if (dp->pmd_max_sleep_default != default_max_sleep) {
+        dp->pmd_max_sleep_default = default_max_sleep;
+        default_changed = true;
+    }
+    pmd_changed = assign_sleep_values_to_pmds(dp, num_vals, pmd_sleeps);
+
+    free(pmd_sleeps);
+    return default_changed || pmd_changed;
+}
+
 /* Applies datapath configuration from the database. Some of the changes are
  * actually applied in dpif_netdev_run(). */
 static int
@@ -4860,7 +5094,6 @@ dpif_netdev_set_config(struct dpif *dpif, const struct smap *other_config)
     uint64_t rebalance_intvl;
     uint8_t cur_rebalance_load;
     uint32_t rebalance_load, rebalance_improve;
-    uint64_t  pmd_max_sleep, cur_pmd_max_sleep;
     bool log_autolb = false;
     enum sched_assignment_type pmd_rxq_assign_type;
     static bool first_set_config = true;
@@ -5011,27 +5244,21 @@ dpif_netdev_set_config(struct dpif *dpif, const struct smap *other_config)
 
     set_pmd_auto_lb(dp, autolb_state, log_autolb);
 
-    pmd_max_sleep = smap_get_ullong(other_config, "pmd-maxsleep", UINT64_MAX);
-    if (pmd_max_sleep != UINT64_MAX) {
-        VLOG_WARN("pmd-maxsleep is deprecated. "
-                  "Please use pmd-sleep-max instead.");
-    } else {
-        pmd_max_sleep = 0;
+    bool sleep_changed = set_all_pmd_max_sleeps(dp, other_config);
+    if (first_set_config || sleep_changed) {
+        log_all_pmd_sleeps(dp);
     }
 
-    pmd_max_sleep = smap_get_ullong(other_config, "pmd-sleep-max",
-                                    pmd_max_sleep);
-    pmd_max_sleep = MIN(PMD_RCU_QUIESCE_INTERVAL, pmd_max_sleep);
-    atomic_read_relaxed(&dp->pmd_max_sleep, &cur_pmd_max_sleep);
-    if (first_set_config || pmd_max_sleep != cur_pmd_max_sleep) {
-        atomic_store_relaxed(&dp->pmd_max_sleep, pmd_max_sleep);
-        VLOG_INFO("PMD max sleep request is %"PRIu64" usecs.", pmd_max_sleep);
-        VLOG_INFO("PMD load based sleeps are %s.",
-                  pmd_max_sleep ? "enabled" : "disabled" );
-    }
-
-    first_set_config  = false;
+    first_set_config = false;
     return 0;
+}
+
+static bool
+dpif_netdev_number_handlers_required(struct dpif *dpif_ OVS_UNUSED,
+                                     uint32_t *n_handlers)
+{
+    *n_handlers = 0;
+    return true;
 }
 
 /* Parses affinity list and returns result in 'core_ids'. */
@@ -7059,7 +7286,7 @@ reload:
         pmd_perf_start_iteration(s);
 
         atomic_read_relaxed(&pmd->dp->smc_enable_db, &pmd->ctx.smc_enable_db);
-        atomic_read_relaxed(&pmd->dp->pmd_max_sleep, &max_sleep);
+        atomic_read_relaxed(&pmd->max_sleep, &max_sleep);
 
         for (i = 0; i < poll_cnt; i++) {
 
@@ -7646,6 +7873,8 @@ dp_netdev_configure_pmd(struct dp_netdev_pmd_thread *pmd, struct dp_netdev *dp,
     hmap_init(&pmd->send_port_cache);
     cmap_init(&pmd->tx_bonds);
 
+    pmd_init_max_sleep(dp, pmd);
+
     /* Initialize DPIF function pointer to the default configured version. */
     atomic_init(&pmd->netdev_input_func, dp_netdev_impl_get_default());
 
@@ -7976,7 +8205,9 @@ dp_netdev_upcall(struct dp_netdev_pmd_thread *pmd, struct dp_packet *packet_,
         ds_destroy(&ds);
     }
 
-    dp_packet_ol_send_prepare(packet_, 0);
+    if (type != DPIF_UC_MISS) {
+        dp_packet_ol_send_prepare(packet_, 0);
+    }
 
     return dp->upcall_cb(packet_, flow, ufid, pmd->core_id, type, userdata,
                          actions, wc, put_actions, dp->upcall_aux);
@@ -8692,6 +8923,32 @@ static void
 dp_netdev_recirculate(struct dp_netdev_pmd_thread *pmd,
                       struct dp_packet_batch *packets)
 {
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+    size_t i, size = dp_packet_batch_size(packets);
+    struct dp_packet *packet;
+
+    DP_PACKET_BATCH_REFILL_FOR_EACH (i, size, packet, packets) {
+        if (dp_packet_hwol_is_tunnel(packet)) {
+            if (dp_packet_hwol_is_tso(packet)) {
+                /* Can't perform GSO in the middle of a pipeline. */
+                COVERAGE_INC(datapath_drop_tunnel_tso_recirc);
+                dp_packet_delete(packet);
+                VLOG_WARN_RL(&rl, "Recirculating tunnel packets with "
+                                  "TSO is not supported");
+                continue;
+            }
+            /* Have to fix all the checksums before re-parsing, because the
+             * packet will be treated as having a single set of headers. */
+            dp_packet_ol_send_prepare(packet, 0);
+            /* This packet must not be marked with anything tunnel-related. */
+            dp_packet_hwol_reset_tunnel(packet);
+            /* Clear inner offsets.  Other ones are collateral, but they will
+             * be re-initialized on re-parsing. */
+            dp_packet_reset_offsets(packet);
+        }
+        dp_packet_batch_refill(packets, packet, i);
+    }
+
     dp_netdev_input__(pmd, packets, true, 0);
 }
 
@@ -9189,9 +9446,13 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
                             nl_attr_get_u16(b_nest);
                         proto_num_max_specified = true;
                         break;
-                    case OVS_NAT_ATTR_PERSISTENT:
-                    case OVS_NAT_ATTR_PROTO_HASH:
                     case OVS_NAT_ATTR_PROTO_RANDOM:
+                        nat_action_info.nat_flags |= NAT_RANGE_RANDOM;
+                        break;
+                    case OVS_NAT_ATTR_PERSISTENT:
+                        nat_action_info.nat_flags |= NAT_PERSISTENT;
+                        break;
+                    case OVS_NAT_ATTR_PROTO_HASH:
                         break;
                     case OVS_NAT_ATTR_UNSPEC:
                     case __OVS_NAT_ATTR_MAX:
@@ -9228,9 +9489,8 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
         }
 
         conntrack_execute(dp->conntrack, packets_, aux->flow->dl_type, force,
-                          commit, zone, setmark, setlabel, aux->flow->tp_src,
-                          aux->flow->tp_dst, helper, nat_action_info_ref,
-                          pmd->ctx.now / 1000, tp_id);
+                          commit, zone, setmark, setlabel, helper,
+                          nat_action_info_ref, pmd->ctx.now / 1000, tp_id);
         break;
     }
 
@@ -9258,6 +9518,8 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
     case OVS_ACTION_ATTR_CHECK_PKT_LEN:
     case OVS_ACTION_ATTR_DROP:
     case OVS_ACTION_ATTR_ADD_MPLS:
+    case OVS_ACTION_ATTR_DEC_TTL:
+    case OVS_ACTION_ATTR_PSAMPLE:
     case __OVS_ACTION_ATTR_MAX:
         OVS_NOT_REACHED();
     }
@@ -9446,17 +9708,10 @@ dpif_netdev_ct_get_sweep_interval(struct dpif *dpif, uint32_t *ms)
 
 static int
 dpif_netdev_ct_set_limits(struct dpif *dpif,
-                           const uint32_t *default_limits,
                            const struct ovs_list *zone_limits)
 {
     int err = 0;
     struct dp_netdev *dp = get_dp_netdev(dpif);
-    if (default_limits) {
-        err = zone_limit_update(dp->conntrack, DEFAULT_ZONE, *default_limits);
-        if (err != 0) {
-            return err;
-        }
-    }
 
     struct ct_dpif_zone_limit *zone_limit;
     LIST_FOR_EACH (zone_limit, node, zone_limits) {
@@ -9471,19 +9726,11 @@ dpif_netdev_ct_set_limits(struct dpif *dpif,
 
 static int
 dpif_netdev_ct_get_limits(struct dpif *dpif,
-                           uint32_t *default_limit,
                            const struct ovs_list *zone_limits_request,
                            struct ovs_list *zone_limits_reply)
 {
     struct dp_netdev *dp = get_dp_netdev(dpif);
-    struct conntrack_zone_limit czl;
-
-    czl = zone_limit_get(dp->conntrack, DEFAULT_ZONE);
-    if (czl.zone == DEFAULT_ZONE) {
-        *default_limit = czl.limit;
-    } else {
-        return EINVAL;
-    }
+    struct conntrack_zone_info czl;
 
     if (!ovs_list_is_empty(zone_limits_request)) {
         struct ct_dpif_zone_limit *zone_limit;
@@ -9492,17 +9739,23 @@ dpif_netdev_ct_get_limits(struct dpif *dpif,
             if (czl.zone == zone_limit->zone || czl.zone == DEFAULT_ZONE) {
                 ct_dpif_push_zone_limit(zone_limits_reply, zone_limit->zone,
                                         czl.limit,
-                                        atomic_count_get(&czl.count));
+                                        czl.count);
             } else {
                 return EINVAL;
             }
         }
     } else {
+        czl = zone_limit_get(dp->conntrack, DEFAULT_ZONE);
+        if (czl.zone == DEFAULT_ZONE) {
+            ct_dpif_push_zone_limit(zone_limits_reply, DEFAULT_ZONE,
+                                    czl.limit, 0);
+        }
+
         for (int z = MIN_ZONE; z <= MAX_ZONE; z++) {
             czl = zone_limit_get(dp->conntrack, z);
             if (czl.zone == z) {
                 ct_dpif_push_zone_limit(zone_limits_reply, z, czl.limit,
-                                        atomic_count_get(&czl.count));
+                                        czl.count);
             }
         }
     }
@@ -9775,7 +10028,7 @@ const struct dpif_class dpif_netdev_class = {
     dpif_netdev_offload_stats_get,
     NULL,                       /* recv_set */
     NULL,                       /* handlers_set */
-    NULL,                       /* number_handlers_required */
+    dpif_netdev_number_handlers_required,
     dpif_netdev_set_config,
     dpif_netdev_queue_to_priority,
     NULL,                       /* recv */

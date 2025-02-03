@@ -36,8 +36,68 @@ vlog.set_levels_from_string("console:dbg")
 vlog.init(None)
 
 
+def substitute_object_text(data, quotechar='"', obj_chars=("{}", "[]"),
+                           tag_format="_OBJECT_{}_"):
+    """Replace objects in strings with tags that can later be retrieved
+
+    Given data like:
+    'cmd1 1, cmd2 {"a": {"a": "b"}}, cmd3 1 2, cmd4 ["a", "b"]'
+
+    Return an output string:
+    'cmd1 1, cmd2 _OBJECT_0_, cmd3 1 2, cmd4 _OBJECT_1_'
+
+    and a dictionary of replaced text:
+    {'_OBJECT_0_': '{"a": {"a": "b"}}', '_OBJECT_1_': '["a", "b"]'}
+    """
+
+    obj_chars = dict(obj_chars)
+    in_quote = False
+    in_object = []  # Stack of nested outer object opening characters.
+    replaced_text = {}
+    output = ""
+    start = end = 0
+    for i, c in enumerate(data):
+        if not in_object:
+            if not in_quote and c in obj_chars:
+                # This is the start of a non-quoted outer object that will
+                # be replaced by a tag.
+                in_object.append(c)
+                start = i
+            else:
+                # Regular output.
+                output += c
+            if c == quotechar:
+                in_quote = not in_quote
+        elif not in_quote:  # Unquoted object.
+            if c == in_object[0]:
+                # Record on the stack that we are in a nested object of the
+                # same type as the outer object, this object will not be
+                # substituted with a tag.
+                in_object.append(c)
+            elif c == obj_chars[in_object[0]]:
+                # This is the closing character to this potentially nested
+                # object's opening character, so pop it off the stack.
+                in_object.pop()
+                if not in_object:
+                    # This is the outer object's closing character, so record
+                    # the substituted text and generate the tagged text.
+                    end = i + 1
+                    tag = tag_format.format(len(replaced_text))
+                    replaced_text[tag] = data[start:end]
+                    output += tag
+    return output, replaced_text
+
+
+def recover_object_text_from_list(words, json):
+    if not json:
+        return words
+    # NOTE(twilson) This does not handle the case of having multiple replaced
+    # objects in the same word, e.g. two json adjacent json strings.
+    return [json.get(word, word) for word in words]
+
+
 def unbox_json(json):
-    if type(json) == list and len(json) == 1:
+    if type(json) is list and len(json) == 1:
         return json[0]
     else:
         return json
@@ -228,6 +288,10 @@ def get_link2_table_printable_row(row):
     return s
 
 
+def get_indexed_table_printable_row(row):
+    return "i=%s" % row.i
+
+
 def get_singleton_table_printable_row(row):
     return "name=%s" % row.name
 
@@ -307,6 +371,14 @@ def print_idl(idl, step, terse=False):
                       terse)
             n += 1
 
+    if "indexed" in idl.tables:
+        ind = idl.tables["indexed"].rows
+        for row in ind.values():
+            print_row("indexed", row, step,
+                      get_indexed_table_printable_row(row),
+                      terse)
+            n += 1
+
     if "singleton" in idl.tables:
         sng = idl.tables["singleton"].rows
         for row in sng.values():
@@ -325,9 +397,9 @@ def substitute_uuids(json, symtab):
         symbol = symtab.get(json)
         if symbol:
             return str(symbol)
-    elif type(json) == list:
+    elif type(json) is list:
         return [substitute_uuids(element, symtab) for element in json]
-    elif type(json) == dict:
+    elif type(json) is dict:
         d = {}
         for key, value in json.items():
             d[key] = substitute_uuids(value, symtab)
@@ -341,10 +413,10 @@ def parse_uuids(json, symtab):
         name = "#%d#" % len(symtab)
         sys.stderr.write("%s = %s\n" % (name, json))
         symtab[name] = json
-    elif type(json) == list:
+    elif type(json) is list:
         for element in json:
             parse_uuids(element, symtab)
-    elif type(json) == dict:
+    elif type(json) is dict:
         for value in json.values():
             parse_uuids(value, symtab)
 
@@ -377,8 +449,15 @@ def idl_set(idl, commands, step):
     increment = False
     fetch_cmds = []
     events = []
+    # `commands` is a comma-separated list of space-separated arguments.  To
+    # handle commands that take arguments that may contain spaces or commas,
+    # e.g. JSON, it is necessary to process `commands` to extract those
+    # arguments before splitting by ',' or ' ' below, and then re-insert them
+    # after the arguments are split.
+    commands, data = substitute_object_text(commands)
     for command in commands.split(','):
         words = command.split()
+        words = recover_object_text_from_list(words, data)
         name = words[0]
         args = words[1:]
 
@@ -434,9 +513,15 @@ def idl_set(idl, commands, step):
                 sys.stderr.write('"set" command requires 2 argument\n')
                 sys.exit(1)
 
-            s = txn.insert(idl.tables["simple"], new_uuid=args[0],
+            s = txn.insert(idl.tables["simple"], new_uuid=uuid.UUID(args[0]),
                            persist_uuid=True)
             s.i = int(args[1])
+        elif name == "add_op":
+            if len(args) != 1:
+                sys.stderr.write('"add_op" command requires 1 argument\n')
+                sys.stderr.write(f"args={args}\n")
+                sys.exit(1)
+            txn.add_op(ovs.json.from_string(args[0]))
         elif name == "delete":
             if len(args) != 1:
                 sys.stderr.write('"delete" command requires 1 argument\n')
@@ -660,7 +745,7 @@ def do_idl(schema_file, remote, *commands):
 
     if remote.startswith("ssl:"):
         if len(commands) < 3:
-            sys.stderr.write("SSL connection requires private key, "
+            sys.stderr.write("SSL/TLS connection requires private key, "
                              "certificate for private key, and peer CA "
                              "certificate as arguments\n")
             sys.exit(1)
@@ -690,6 +775,9 @@ def do_idl(schema_file, remote, *commands):
     idl = ovs.db.idl.Idl(remote, schema_helper, leader_only=False)
     if "simple3" in idl.tables:
         idl.index_create("simple3", "simple3_by_name")
+    if "indexed" in idl.tables:
+        idx = idl.index_create("indexed", "indexed_by_i")
+        idx.add_column("i")
 
     if commands:
         remotes = remote.split(',')
@@ -757,16 +845,23 @@ def do_idl(schema_file, remote, *commands):
                 poller.block()
         else:
             # Wait for update.
-            while idl.change_seqno == seqno and not idl.run():
-                rpc.run()
+            while True:
+                while idl.change_seqno == seqno and not idl.run():
+                    rpc.run()
 
-                poller = ovs.poller.Poller()
-                idl.wait(poller)
-                rpc.wait(poller)
-                poller.block()
+                    poller = ovs.poller.Poller()
+                    idl.wait(poller)
+                    rpc.wait(poller)
+                    poller.block()
 
-            print_idl(idl, step, terse)
-            step += 1
+                print_idl(idl, step, terse)
+                step += 1
+
+                # Run IDL forever in case of a simple monitor, otherwise
+                # break and execute the command.
+                seqno = idl.change_seqno
+                if command != "monitor":
+                    break
 
         seqno = idl.change_seqno
 
@@ -875,7 +970,7 @@ def do_idl_cluster(schema_file, remote, pid, *commands):
 
     if remote.startswith("ssl:"):
         if len(commands) < 3:
-            sys.stderr.write("SSL connection requires private key, "
+            sys.stderr.write("SSL/TLS connection requires private key, "
                              "certificate for private key, and peer CA "
                              "certificate as arguments\n")
             sys.exit(1)
@@ -1049,14 +1144,14 @@ def main(argv):
         sys.exit(1)
 
     func, n_args = commands[command_name]
-    if type(n_args) == tuple:
+    if type(n_args) is tuple:
         if len(args) < n_args[0]:
             sys.stderr.write("%s: \"%s\" requires at least %d arguments but "
                              "only %d provided\n"
                              % (ovs.util.PROGRAM_NAME, command_name,
                                 n_args[0], len(args)))
             sys.exit(1)
-    elif type(n_args) == int:
+    elif type(n_args) is int:
         if len(args) != n_args:
             sys.stderr.write("%s: \"%s\" requires %d arguments but %d "
                              "provided\n"

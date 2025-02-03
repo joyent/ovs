@@ -28,6 +28,7 @@
 #include "fail-open.h"
 #include "guarded-list.h"
 #include "hmapx.h"
+#include "openvswitch/json.h"
 #include "lacp.h"
 #include "learn.h"
 #include "mac-learning.h"
@@ -49,6 +50,7 @@
 #include "ofproto-dpif-sflow.h"
 #include "ofproto-dpif-trace.h"
 #include "ofproto-dpif-upcall.h"
+#include "ofproto-dpif-lsample.h"
 #include "ofproto-dpif-xlate.h"
 #include "ofproto-dpif-xlate-cache.h"
 #include "openvswitch/ofp-actions.h"
@@ -220,6 +222,8 @@ static void ofproto_unixctl_init(void);
 static void ct_zone_config_init(struct dpif_backer *backer);
 static void ct_zone_config_uninit(struct dpif_backer *backer);
 static void ct_zone_timeout_policy_sweep(struct dpif_backer *backer);
+static void ct_zone_limits_commit(struct dpif_backer *backer);
+static bool recheck_support_explicit_drop_action(struct dpif_backer *backer);
 
 static inline struct ofproto_dpif *
 ofproto_dpif_cast(const struct ofproto *ofproto)
@@ -390,6 +394,10 @@ type_run(const char *type)
         udpif_set_threads(backer->udpif, n_handlers, n_revalidators);
     }
 
+    if (recheck_support_explicit_drop_action(backer)) {
+        backer->need_revalidate = REV_RECONFIGURE;
+    }
+
     if (backer->need_revalidate) {
         struct ofproto_dpif *ofproto;
         struct simap_node *node;
@@ -478,7 +486,7 @@ type_run(const char *type)
                               ofproto->backer->dpif, ofproto->ml,
                               ofproto->stp, ofproto->rstp, ofproto->ms,
                               ofproto->mbridge, ofproto->sflow, ofproto->ipfix,
-                              ofproto->netflow,
+                              ofproto->lsample, ofproto->netflow,
                               ofproto->up.forward_bpdu,
                               connmgr_has_in_band(ofproto->up.connmgr),
                               &ofproto->backer->rt_support);
@@ -513,6 +521,7 @@ type_run(const char *type)
 
     process_dpif_port_changes(backer);
     ct_zone_timeout_policy_sweep(backer);
+    ct_zone_limits_commit(backer);
 
     return 0;
 }
@@ -715,6 +724,8 @@ close_dpif_backer(struct dpif_backer *backer, bool del)
 }
 
 static void check_support(struct dpif_backer *backer);
+static void copy_support(struct dpif_backer_support *dst,
+                         struct dpif_backer_support *src);
 
 static int
 open_dpif_backer(const char *type, struct dpif_backer **backerp)
@@ -835,7 +846,7 @@ open_dpif_backer(const char *type, struct dpif_backer **backerp)
      * 'boottime_support' can be checked to prevent 'support' to be changed
      * beyond the datapath capabilities. In case 'support' is changed by
      * the user, 'boottime_support' can be used to restore it.  */
-    backer->bt_support = backer->rt_support;
+    copy_support(&backer->bt_support, &backer->rt_support);
 
     return error;
 }
@@ -851,13 +862,23 @@ ovs_native_tunneling_is_on(struct ofproto_dpif *ofproto)
 bool
 ovs_explicit_drop_action_supported(struct ofproto_dpif *ofproto)
 {
-    return ofproto->backer->rt_support.explicit_drop_action;
+    bool value;
+
+    atomic_read_relaxed(&ofproto->backer->rt_support.explicit_drop_action,
+                        &value);
+    return value;
 }
 
 bool
 ovs_lb_output_action_supported(struct ofproto_dpif *ofproto)
 {
     return ofproto->backer->rt_support.lb_output_action;
+}
+
+bool
+ovs_psample_supported(struct ofproto_dpif *ofproto)
+{
+    return ofproto->backer->rt_support.psample;
 }
 
 /* Tests whether 'backer''s datapath supports recirculation.  Only newer
@@ -1255,7 +1276,7 @@ check_ct_eventmask(struct dpif_backer *backer)
 
     /* Compose a dummy UDP packet. */
     dp_packet_init(&packet, 0);
-    flow_compose(&packet, &flow, NULL, 64);
+    flow_compose(&packet, &flow, NULL, 64, false);
 
     /* Execute the actions.  On older datapaths this fails with EINVAL, on
      * newer datapaths it succeeds. */
@@ -1348,7 +1369,7 @@ check_ct_timeout_policy(struct dpif_backer *backer)
 
     /* Compose a dummy UDP packet. */
     dp_packet_init(&packet, 0);
-    flow_compose(&packet, &flow, NULL, 64);
+    flow_compose(&packet, &flow, NULL, 64, false);
 
     /* Execute the actions.  On older datapaths this fails with EINVAL, on
      * newer datapaths it succeeds. */
@@ -1373,6 +1394,40 @@ check_ct_timeout_policy(struct dpif_backer *backer)
     }
 
     return !error;
+}
+
+/* Tests whether backer's datapath supports the OVS_ACTION_ATTR_DROP action. */
+static bool
+check_drop_action(struct dpif_backer *backer)
+{
+    struct odputil_keybuf keybuf;
+    uint8_t actbuf[NL_A_U32_SIZE];
+    struct ofpbuf actions;
+    struct ofpbuf key;
+    bool supported;
+
+    struct flow flow = {
+        .dl_type = CONSTANT_HTONS(0x1234), /* bogus */
+    };
+    struct odp_flow_key_parms odp_parms = {
+        .flow = &flow,
+        .probe = true,
+    };
+
+    ofpbuf_use_stack(&key, &keybuf, sizeof keybuf);
+    odp_flow_key_from_flow(&odp_parms, &key);
+
+    ofpbuf_use_stack(&actions, &actbuf, sizeof actbuf);
+    nl_msg_put_u32(&actions, OVS_ACTION_ATTR_DROP, XLATE_OK);
+
+    supported = dpif_may_support_explicit_drop_action(backer->dpif) &&
+                dpif_probe_feature(backer->dpif, "drop", &key, &actions, NULL);
+
+    VLOG_INFO("%s: Datapath %s explicit drop action",
+              dpif_name(backer->dpif),
+              (supported) ? "supports" : "does not support");
+
+    return supported;
 }
 
 /* Tests whether 'backer''s datapath supports the all-zero SNAT case. */
@@ -1562,6 +1617,44 @@ check_add_mpls(struct dpif_backer *backer)
     return supported;
 }
 
+/* Tests whether 'backer''s datapath supports the OVS_ACTION_ATTR_PSAMPLE
+ * action. */
+static bool
+check_psample(struct dpif_backer *backer)
+{
+    uint8_t cookie[OVS_PSAMPLE_COOKIE_MAX_SIZE];
+    struct odputil_keybuf keybuf;
+    struct ofpbuf actions;
+    struct ofpbuf key;
+    bool supported;
+
+    /* Intentionally bogus dl_type. */
+    struct flow flow = {
+        .dl_type = CONSTANT_HTONS(0x1234),
+    };
+    struct odp_flow_key_parms odp_parms = {
+        .flow = &flow,
+        .probe = true,
+    };
+
+    ofpbuf_use_stack(&key, &keybuf, sizeof keybuf);
+    odp_flow_key_from_flow(&odp_parms, &key);
+    ofpbuf_init(&actions, 32);
+
+    /* Generate a random max-size cookie. */
+    random_bytes(cookie, sizeof cookie);
+
+    odp_put_psample_action(&actions, 10, cookie, sizeof cookie);
+
+    supported = dpif_may_support_psample(backer->dpif) &&
+        dpif_probe_feature(backer->dpif, "psample", &key, &actions, NULL);
+
+    ofpbuf_uninit(&actions);
+    VLOG_INFO("%s: Datapath %s psample action", dpif_name(backer->dpif),
+              supported ? "supports" : "does not support");
+    return supported;
+}
+
 #define CHECK_FEATURE__(NAME, SUPPORT, FIELD, VALUE, ETHTYPE)               \
 static bool                                                                 \
 check_##NAME(struct dpif_backer *backer)                                    \
@@ -1610,6 +1703,24 @@ CHECK_FEATURE__(ct_orig_tuple6, ct_orig_tuple6, ct_nw_proto, 1, ETH_TYPE_IPV6)
 #undef CHECK_FEATURE__
 
 static void
+copy_support(struct dpif_backer_support *dst, struct dpif_backer_support *src)
+{
+#define DPIF_SUPPORT_FIELD(TYPE, NAME, TITLE) \
+    if (!strcmp(#TYPE, "atomic_bool")) { \
+        bool value; \
+        atomic_read_relaxed((atomic_bool *) &src->NAME, &value); \
+        atomic_store_relaxed((atomic_bool *) &dst->NAME, value); \
+    } else { \
+        dst->NAME = src->NAME; \
+    }
+
+    DPIF_SUPPORT_FIELDS
+#undef DPIF_SUPPORT_FIELD
+
+    dst->odp = src->odp;
+}
+
+static void
 check_support(struct dpif_backer *backer)
 {
     /* Actions. */
@@ -1627,12 +1738,13 @@ check_support(struct dpif_backer *backer)
     backer->rt_support.max_hash_alg = check_max_dp_hash_alg(backer);
     backer->rt_support.check_pkt_len = check_check_pkt_len(backer);
     backer->rt_support.ct_timeout = check_ct_timeout_policy(backer);
-    backer->rt_support.explicit_drop_action =
-        dpif_supports_explicit_drop_action(backer->dpif);
+    atomic_store_relaxed(&backer->rt_support.explicit_drop_action,
+                         check_drop_action(backer));
     backer->rt_support.lb_output_action =
         dpif_supports_lb_output_action(backer->dpif);
     backer->rt_support.ct_zero_snat = dpif_supports_ct_zero_snat(backer);
     backer->rt_support.add_mpls = check_add_mpls(backer);
+    backer->rt_support.psample = check_psample(backer);
 
     /* Flow fields. */
     backer->rt_support.odp.ct_state = check_ct_state(backer);
@@ -1643,6 +1755,28 @@ check_support(struct dpif_backer *backer)
     backer->rt_support.odp.ct_orig_tuple = check_ct_orig_tuple(backer);
     backer->rt_support.odp.ct_orig_tuple6 = check_ct_orig_tuple6(backer);
     backer->rt_support.odp.nd_ext = check_nd_extensions(backer);
+}
+
+/* TC does not support offloading the explicit drop action. As such we need to
+ * re-probe the datapath if hw-offload has been modified.
+ * Note: We don't support true --> false transition as that requires a restart.
+ * See netdev_set_flow_api_enabled(). */
+static bool
+recheck_support_explicit_drop_action(struct dpif_backer *backer)
+{
+    bool explicit_drop_action;
+
+    atomic_read_relaxed(&backer->rt_support.explicit_drop_action,
+                        &explicit_drop_action);
+
+    if (explicit_drop_action
+        && !dpif_may_support_explicit_drop_action(backer->dpif)) {
+        ovs_assert(!check_drop_action(backer));
+        atomic_store_relaxed(&backer->rt_support.explicit_drop_action, false);
+        return true;
+    }
+
+    return false;
 }
 
 static int
@@ -1685,6 +1819,7 @@ construct(struct ofproto *ofproto_)
     ofproto->change_seq = 0;
     ofproto->ams_seq = seq_create();
     ofproto->ams_seqno = seq_read(ofproto->ams_seq);
+    ofproto->explicit_sampled_drops = false;
 
 
     SHASH_FOR_EACH_SAFE (node, &init_ofp_ports) {
@@ -1824,6 +1959,7 @@ destruct(struct ofproto *ofproto_, bool del)
     netflow_unref(ofproto->netflow);
     dpif_sflow_unref(ofproto->sflow);
     dpif_ipfix_unref(ofproto->ipfix);
+    dpif_lsample_unref(ofproto->lsample);
     hmap_destroy(&ofproto->bundles);
     mac_learning_unref(ofproto->ml);
     mcast_snooping_unref(ofproto->ms);
@@ -1955,6 +2091,11 @@ run(struct ofproto *ofproto_)
                 }
             }
         }
+    }
+
+    if (ofproto->explicit_sampled_drops != ofproto_explicit_sampled_drops) {
+        ofproto->explicit_sampled_drops = ofproto_explicit_sampled_drops;
+        ofproto->backer->need_revalidate = REV_RECONFIGURE;
     }
     return 0;
 }
@@ -2381,6 +2522,41 @@ get_ipfix_stats(const struct ofproto *ofproto_,
     }
 
     return dpif_ipfix_get_stats(di, bridge_ipfix, replies);
+}
+
+static int
+set_local_sample(struct ofproto *ofproto_,
+                 const struct ofproto_lsample_options *options,
+                 size_t n_opts)
+{
+    struct ofproto_dpif *ofproto = ofproto_dpif_cast(ofproto_);
+    struct dpif_lsample *lsample = ofproto->lsample;
+    bool changed = false;
+
+    if (!ofproto->backer->rt_support.psample) {
+        return EOPNOTSUPP;
+    }
+
+    if (n_opts && !lsample) {
+        lsample = ofproto->lsample = dpif_lsample_create();
+        changed = true;
+    }
+
+    if (lsample) {
+        if (!n_opts) {
+            dpif_lsample_unref(lsample);
+            lsample = ofproto->lsample = NULL;
+            changed = true;
+        } else if (dpif_lsample_set_options(lsample, options, n_opts)) {
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        ofproto->backer->need_revalidate = REV_RECONFIGURE;
+    }
+
+    return 0;
 }
 
 static int
@@ -3643,7 +3819,7 @@ mirror_set__(struct ofproto *ofproto_, void *aux,
              const struct ofproto_mirror_settings *s)
 {
     struct ofproto_dpif *ofproto = ofproto_dpif_cast(ofproto_);
-    struct ofbundle **srcs, **dsts;
+    struct mirror_bundles mb;
     int error;
     size_t i;
 
@@ -3652,23 +3828,34 @@ mirror_set__(struct ofproto *ofproto_, void *aux,
         return 0;
     }
 
-    srcs = xmalloc(s->n_srcs * sizeof *srcs);
-    dsts = xmalloc(s->n_dsts * sizeof *dsts);
+    mb.srcs = xmalloc(s->n_srcs * sizeof *mb.srcs);
+    mb.dsts = xmalloc(s->n_dsts * sizeof *mb.dsts);
 
     for (i = 0; i < s->n_srcs; i++) {
-        srcs[i] = bundle_lookup(ofproto, s->srcs[i]);
+        mb.srcs[i] = bundle_lookup(ofproto, s->srcs[i]);
     }
 
     for (i = 0; i < s->n_dsts; i++) {
-        dsts[i] = bundle_lookup(ofproto, s->dsts[i]);
+        mb.dsts[i] = bundle_lookup(ofproto, s->dsts[i]);
     }
 
-    error = mirror_set(ofproto->mbridge, aux, s->name, srcs, s->n_srcs, dsts,
-                       s->n_dsts, s->src_vlans,
-                       bundle_lookup(ofproto, s->out_bundle),
-                       s->snaplen, s->out_vlan);
-    free(srcs);
-    free(dsts);
+    mb.n_srcs = s->n_srcs;
+    mb.n_dsts = s->n_dsts;
+    mb.out_bundle = bundle_lookup(ofproto, s->out_bundle);
+
+    error = mirror_set(ofproto->mbridge, ofproto_, aux, s, &mb);
+
+    if (!error) {
+        ofproto->backer->need_revalidate = REV_RECONFIGURE;
+    } else if (error == ECANCELED) {
+        /* The user requested a change that is identical to the current state,
+         * the reconfiguration is canceled, but don't log an error message
+         * about that. */
+        error = 0;
+    }
+
+    free(mb.srcs);
+    free(mb.dsts);
     return error;
 }
 
@@ -3902,15 +4089,21 @@ port_query_by_name(const struct ofproto *ofproto_, const char *devname,
     int error;
 
     if (sset_contains(&ofproto->ghost_ports, devname)) {
-        const char *type = netdev_get_type_from_name(devname);
-
         /* We may be called before ofproto->up.port_by_name is populated with
          * the appropriate ofport.  For this reason, we must get the name and
-         * type from the netdev layer directly. */
-        if (type) {
-            const struct ofport *ofport;
+         * type from the netdev layer directly.
+         * However, when a port deleted, the corresponding netdev is also
+         * removed from netdev_shash. netdev_get_type_from_name returns NULL
+         * in such case and we should try to get type from ofport->netdev. */
+        const char *type = netdev_get_type_from_name(devname);
+        const struct ofport *ofport =
+                        shash_find_data(&ofproto->up.port_by_name, devname);
 
-            ofport = shash_find_data(&ofproto->up.port_by_name, devname);
+        if (!type && ofport && ofport->netdev) {
+            type = netdev_get_type(ofport->netdev);
+        }
+
+        if (type) {
             ofproto_port->ofp_port = ofport ? ofport->ofp_port : OFPP_NONE;
             ofproto_port->name = xstrdup(devname);
             ofproto_port->type = xstrdup(type);
@@ -4383,15 +4576,20 @@ ofproto_dpif_get_tables_version(struct ofproto_dpif *ofproto)
  * a reference.
  *
  * 'flow' is non-const to allow for temporary modifications during the lookup.
- * Any changes are restored before returning. */
+ * Any changes are restored before returning.
+ *
+ * 'conj_flows' is an optional parameter.  If it is non-null, the matching
+ * conjunctive flows are inserted. */
 static struct rule_dpif *
 rule_dpif_lookup_in_table(struct ofproto_dpif *ofproto, ovs_version_t version,
                           uint8_t table_id, struct flow *flow,
-                          struct flow_wildcards *wc)
+                          struct flow_wildcards *wc,
+                          struct hmapx *conj_flows)
 {
     struct classifier *cls = &ofproto->up.tables[table_id].cls;
     return rule_dpif_cast(rule_from_cls_rule(classifier_lookup(cls, version,
-                                                               flow, wc)));
+                                                               flow, wc,
+                                                               conj_flows)));
 }
 
 void
@@ -4433,7 +4631,10 @@ ofproto_dpif_credit_table_stats(struct ofproto_dpif *ofproto, uint8_t table_id,
  * 'in_port'.  This is needed for resubmit action support.
  *
  * 'flow' is non-const to allow for temporary modifications during the lookup.
- * Any changes are restored before returning. */
+ * Any changes are restored before returning.
+ *
+ * 'conj_flows' is an optional parameter.  If it is non-null, the matching
+ * conjunctive flows are inserted. */
 struct rule_dpif *
 rule_dpif_lookup_from_table(struct ofproto_dpif *ofproto,
                             ovs_version_t version, struct flow *flow,
@@ -4441,7 +4642,8 @@ rule_dpif_lookup_from_table(struct ofproto_dpif *ofproto,
                             const struct dpif_flow_stats *stats,
                             uint8_t *table_id, ofp_port_t in_port,
                             bool may_packet_in, bool honor_table_miss,
-                            struct xlate_cache *xcache)
+                            struct xlate_cache *xcache,
+                            struct hmapx *conj_flows)
 {
     ovs_be16 old_tp_src = flow->tp_src, old_tp_dst = flow->tp_dst;
     ofp_port_t old_in_port = flow->in_port.ofp_port;
@@ -4497,7 +4699,8 @@ rule_dpif_lookup_from_table(struct ofproto_dpif *ofproto,
          next_id++, next_id += (next_id == TBL_INTERNAL))
     {
         *table_id = next_id;
-        rule = rule_dpif_lookup_in_table(ofproto, version, next_id, flow, wc);
+        rule = rule_dpif_lookup_in_table(ofproto, version, next_id, flow, wc,
+                                         conj_flows);
         if (stats) {
             struct oftable *tbl = &ofproto->up.tables[next_id];
             unsigned long orig;
@@ -5138,8 +5341,10 @@ group_setup_dp_hash_table(struct group_dpif *group, size_t max_hash)
              min_weight, total_weight);
 
     uint64_t min_slots = DIV_ROUND_UP(total_weight, min_weight);
-    uint64_t min_slots2 = ROUND_UP_POW2(min_slots);
-    uint64_t n_hash = MAX(16, min_slots2);
+    uint64_t min_slots2 =
+        MAX(min_slots, MIN(n_buckets * 4, MAX_SELECT_GROUP_HASH_VALUES));
+    uint64_t min_slots3 = ROUND_UP_POW2(min_slots2);
+    uint64_t n_hash = MAX(16, min_slots3);
     if (n_hash > MAX_SELECT_GROUP_HASH_VALUES ||
         (max_hash != 0 && n_hash > max_hash)) {
         VLOG_DBG("  Too many hash values required: %"PRIu64, n_hash);
@@ -5522,6 +5727,8 @@ ct_zone_config_init(struct dpif_backer *backer)
     cmap_init(&backer->ct_zones);
     hmap_init(&backer->ct_tps);
     ovs_list_init(&backer->ct_tp_kill_list);
+    ovs_list_init(&backer->ct_zone_limits_to_add);
+    ovs_list_init(&backer->ct_zone_limits_to_del);
     clear_existing_ct_timeout_policies(backer);
 }
 
@@ -5545,6 +5752,8 @@ ct_zone_config_uninit(struct dpif_backer *backer)
     id_pool_destroy(backer->tp_ids);
     cmap_destroy(&backer->ct_zones);
     hmap_destroy(&backer->ct_tps);
+    ct_dpif_free_zone_limits(&backer->ct_zone_limits_to_add);
+    ct_dpif_free_zone_limits(&backer->ct_zone_limits_to_del);
 }
 
 static void
@@ -5626,49 +5835,95 @@ ct_del_zone_timeout_policy(const char *datapath_type, uint16_t zone_id)
 }
 
 static void
-get_datapath_cap(const char *datapath_type, struct smap *cap)
+ct_zone_limit_update(const char *datapath_type, int32_t zone_id,
+                     int64_t *limit)
 {
-    struct odp_support odp;
-    struct dpif_backer_support s;
     struct dpif_backer *backer = shash_find_data(&all_dpif_backers,
                                                  datapath_type);
     if (!backer) {
         return;
     }
-    s = backer->rt_support;
-    odp = s.odp;
+
+    if (limit) {
+        ct_dpif_push_zone_limit(&backer->ct_zone_limits_to_add, zone_id,
+                                *limit, 0);
+    } else {
+        ct_dpif_push_zone_limit(&backer->ct_zone_limits_to_del, zone_id, 0, 0);
+    }
+}
+
+static void
+ct_zone_limits_commit(struct dpif_backer *backer)
+{
+    if (!ovs_list_is_empty(&backer->ct_zone_limits_to_add)) {
+        ct_dpif_set_limits(backer->dpif, &backer->ct_zone_limits_to_add);
+        ct_dpif_free_zone_limits(&backer->ct_zone_limits_to_add);
+    }
+
+    if (!ovs_list_is_empty(&backer->ct_zone_limits_to_del)) {
+        ct_dpif_del_limits(backer->dpif, &backer->ct_zone_limits_to_del);
+        ct_dpif_free_zone_limits(&backer->ct_zone_limits_to_del);
+    }
+}
+
+static void
+ct_zone_limit_protection_update(const char *datapath_type, bool protected)
+{
+    struct dpif_backer *backer = shash_find_data(&all_dpif_backers,
+                                                 datapath_type);
+    if (!backer) {
+        return;
+    }
+
+    ct_dpif_set_zone_limit_protection(backer->dpif, protected);
+}
+
+static void
+get_datapath_cap(const char *datapath_type, struct smap *cap)
+{
+    bool explicit_drop_action;
+    struct dpif_backer_support *s;
+    struct dpif_backer *backer = shash_find_data(&all_dpif_backers,
+                                                 datapath_type);
+    if (!backer) {
+        return;
+    }
+    s = &backer->rt_support;
 
     /* ODP_SUPPORT_FIELDS */
     smap_add_format(cap, "max_vlan_headers", "%"PRIuSIZE,
-                    odp.max_vlan_headers);
-    smap_add_format(cap, "max_mpls_depth", "%"PRIuSIZE, odp.max_mpls_depth);
-    smap_add(cap, "recirc", odp.recirc ? "true" : "false");
-    smap_add(cap, "ct_state", odp.ct_state ? "true" : "false");
-    smap_add(cap, "ct_zone", odp.ct_zone ? "true" : "false");
-    smap_add(cap, "ct_mark", odp.ct_mark ? "true" : "false");
-    smap_add(cap, "ct_label", odp.ct_label ? "true" : "false");
-    smap_add(cap, "ct_state_nat", odp.ct_state_nat ? "true" : "false");
-    smap_add(cap, "ct_orig_tuple", odp.ct_orig_tuple ? "true" : "false");
-    smap_add(cap, "ct_orig_tuple6", odp.ct_orig_tuple6 ? "true" : "false");
-    smap_add(cap, "nd_ext", odp.nd_ext ? "true" : "false");
+                    s->odp.max_vlan_headers);
+    smap_add_format(cap, "max_mpls_depth", "%"PRIuSIZE, s->odp.max_mpls_depth);
+    smap_add(cap, "recirc", s->odp.recirc ? "true" : "false");
+    smap_add(cap, "ct_state", s->odp.ct_state ? "true" : "false");
+    smap_add(cap, "ct_zone", s->odp.ct_zone ? "true" : "false");
+    smap_add(cap, "ct_mark", s->odp.ct_mark ? "true" : "false");
+    smap_add(cap, "ct_label", s->odp.ct_label ? "true" : "false");
+    smap_add(cap, "ct_state_nat", s->odp.ct_state_nat ? "true" : "false");
+    smap_add(cap, "ct_orig_tuple", s->odp.ct_orig_tuple ? "true" : "false");
+    smap_add(cap, "ct_orig_tuple6", s->odp.ct_orig_tuple6 ? "true" : "false");
+    smap_add(cap, "nd_ext", s->odp.nd_ext ? "true" : "false");
 
     /* DPIF_SUPPORT_FIELDS */
-    smap_add(cap, "masked_set_action", s.masked_set_action ? "true" : "false");
-    smap_add(cap, "tnl_push_pop", s.tnl_push_pop ? "true" : "false");
-    smap_add(cap, "ufid", s.ufid ? "true" : "false");
-    smap_add(cap, "trunc", s.trunc ? "true" : "false");
-    smap_add(cap, "clone", s.clone ? "true" : "false");
-    smap_add(cap, "sample_nesting", s.sample_nesting ? "true" : "false");
-    smap_add(cap, "ct_eventmask", s.ct_eventmask ? "true" : "false");
-    smap_add(cap, "ct_clear", s.ct_clear ? "true" : "false");
-    smap_add_format(cap, "max_hash_alg", "%"PRIuSIZE, s.max_hash_alg);
-    smap_add(cap, "check_pkt_len", s.check_pkt_len ? "true" : "false");
-    smap_add(cap, "ct_timeout", s.ct_timeout ? "true" : "false");
+    smap_add(cap, "masked_set_action",
+             s->masked_set_action ? "true" : "false");
+    smap_add(cap, "tnl_push_pop", s->tnl_push_pop ? "true" : "false");
+    smap_add(cap, "ufid", s->ufid ? "true" : "false");
+    smap_add(cap, "trunc", s->trunc ? "true" : "false");
+    smap_add(cap, "clone", s->clone ? "true" : "false");
+    smap_add(cap, "sample_nesting", s->sample_nesting ? "true" : "false");
+    smap_add(cap, "ct_eventmask", s->ct_eventmask ? "true" : "false");
+    smap_add(cap, "ct_clear", s->ct_clear ? "true" : "false");
+    smap_add_format(cap, "max_hash_alg", "%"PRIuSIZE, s->max_hash_alg);
+    smap_add(cap, "check_pkt_len", s->check_pkt_len ? "true" : "false");
+    smap_add(cap, "ct_timeout", s->ct_timeout ? "true" : "false");
+    atomic_read_relaxed(&s->explicit_drop_action, &explicit_drop_action);
     smap_add(cap, "explicit_drop_action",
-             s.explicit_drop_action ? "true" :"false");
-    smap_add(cap, "lb_output_action", s.lb_output_action ? "true" : "false");
-    smap_add(cap, "ct_zero_snat", s.ct_zero_snat ? "true" : "false");
-    smap_add(cap, "add_mpls", s.add_mpls ? "true" : "false");
+             explicit_drop_action ? "true" :"false");
+    smap_add(cap, "lb_output_action", s->lb_output_action ? "true" : "false");
+    smap_add(cap, "ct_zero_snat", s->ct_zero_snat ? "true" : "false");
+    smap_add(cap, "add_mpls", s->add_mpls ? "true" : "false");
+    smap_add(cap, "psample", s->psample ? "true" : "false");
 
     /* The ct_tuple_flush is implemented on dpif level, so it is supported
      * for all backers. */
@@ -5945,7 +6200,7 @@ ofproto_unixctl_fdb_add(struct unixctl_conn *conn, int argc OVS_UNUSED,
     const char *port_name = argv[2];
     uint16_t vlan = atoi(argv[3]);
     struct eth_addr mac;
-    int age;
+    time_t age;
 
     ofproto = ofproto_dpif_lookup_by_name(br_name);
     if (!ofproto) {
@@ -6112,7 +6367,7 @@ ofproto_unixctl_mcast_snooping_show(struct unixctl_conn *conn,
         return;
     }
 
-    ds_put_cstr(&ds, " port  VLAN  GROUP                Age\n");
+    ds_put_cstr(&ds, " port  VLAN  protocol  GROUP                Age\n");
     ovs_rwlock_rdlock(&ofproto->ms->rwlock);
     LIST_FOR_EACH (grp, group_node, &ofproto->ms->group_lru) {
         LIST_FOR_EACH(b, bundle_node, &grp->bundle_lru) {
@@ -6121,7 +6376,9 @@ ofproto_unixctl_mcast_snooping_show(struct unixctl_conn *conn,
             bundle = b->port;
             ofputil_port_to_string(ofbundle_get_a_port(bundle)->up.ofp_port,
                                    NULL, name, sizeof name);
-            ds_put_format(&ds, "%5s  %4d  ", name, grp->vlan);
+            ds_put_format(&ds, "%5s  %4d  %-8s  ", name, grp->vlan,
+                          mcast_snooping_group_protocol_str(
+                              grp->protocol_version));
             ipv6_format_mapped(&grp->addr, &ds);
             ds_put_format(&ds, "         %3d\n",
                           mcast_bundle_age(ofproto->ms, b));
@@ -6135,8 +6392,9 @@ ofproto_unixctl_mcast_snooping_show(struct unixctl_conn *conn,
         bundle = mrouter->port;
         ofputil_port_to_string(ofbundle_get_a_port(bundle)->up.ofp_port,
                                NULL, name, sizeof name);
-        ds_put_format(&ds, "%5s  %4d  querier             %3d\n",
+        ds_put_format(&ds, "%5s  %4d  %-8s  querier             %3d\n",
                       name, mrouter->vlan,
+                      mcast_snooping_group_protocol_str(-1),
                       mcast_mrouter_age(ofproto->ms, mrouter));
     }
     ovs_rwlock_unlock(&ofproto->ms->rwlock);
@@ -6186,20 +6444,30 @@ ofproto_unixctl_dpif_dump_dps(struct unixctl_conn *conn, int argc OVS_UNUSED,
 }
 
 static void
-show_dp_feature_bool(struct ds *ds, const char *feature, bool b)
+show_dp_feature_bool(struct ds *ds, const char *feature, const bool *b)
 {
-    ds_put_format(ds, "%s: %s\n", feature, b ? "Yes" : "No");
+    ds_put_format(ds, "%s: %s\n", feature, *b ? "Yes" : "No");
 }
 
 static void
-show_dp_feature_size_t(struct ds *ds, const char *feature, size_t s)
+show_dp_feature_atomic_bool(struct ds *ds, const char *feature,
+                            const atomic_bool *b)
 {
-    ds_put_format(ds, "%s: %"PRIuSIZE"\n", feature, s);
+    bool value;
+    atomic_read_relaxed((atomic_bool *) b, &value);
+    ds_put_format(ds, "%s: %s\n", feature, value ? "Yes" : "No");
+}
+
+static void
+show_dp_feature_size_t(struct ds *ds, const char *feature, const size_t *s)
+{
+    ds_put_format(ds, "%s: %"PRIuSIZE"\n", feature, *s);
 }
 
 enum dpif_support_field_type {
     DPIF_SUPPORT_FIELD_bool,
     DPIF_SUPPORT_FIELD_size_t,
+    DPIF_SUPPORT_FIELD_atomic_bool,
 };
 
 struct dpif_support_field {
@@ -6216,12 +6484,12 @@ static void
 dpif_show_support(const struct dpif_backer_support *support, struct ds *ds)
 {
 #define DPIF_SUPPORT_FIELD(TYPE, NAME, TITLE) \
-    show_dp_feature_##TYPE (ds, TITLE, support->NAME);
+    show_dp_feature_##TYPE (ds, TITLE, &support->NAME);
     DPIF_SUPPORT_FIELDS
 #undef DPIF_SUPPORT_FIELD
 
 #define ODP_SUPPORT_FIELD(TYPE, NAME, TITLE) \
-    show_dp_feature_##TYPE (ds, TITLE, support->odp.NAME );
+    show_dp_feature_##TYPE (ds, TITLE, &support->odp.NAME );
     ODP_SUPPORT_FIELDS
 #undef ODP_SUPPORT_FIELD
 }
@@ -6235,6 +6503,16 @@ display_support_field(const char *name,
     case DPIF_SUPPORT_FIELD_bool: {
         bool v = *(bool *)field->rt_ptr;
         bool b = *(bool *)field->bt_ptr;
+        ds_put_format(ds, "%s (%s) : [run time]:%s, [boot time]:%s\n", name,
+                      field->title, v ? "true" : "false",
+                      b ? "true" : "false");
+        break;
+    }
+    case DPIF_SUPPORT_FIELD_atomic_bool: {
+        bool b, v;
+
+        atomic_read_relaxed((atomic_bool *) field->rt_ptr, &v);
+        atomic_read_relaxed((atomic_bool *) field->bt_ptr, &b);
         ds_put_format(ds, "%s (%s) : [run time]:%s, [boot time]:%s\n", name,
                       field->title, v ? "true" : "false",
                       b ? "true" : "false");
@@ -6257,7 +6535,8 @@ display_support_field(const char *name,
 static bool
 dpif_set_support(struct dpif_backer_support *rt_support,
                  struct dpif_backer_support *bt_support,
-                 const char *name, const char *value, struct ds *ds)
+                 const char *name, const char *value, bool force,
+                 struct ds *ds)
 {
     struct shash all_fields = SHASH_INITIALIZER(&all_fields);
     struct dpif_support_field *field;
@@ -6309,8 +6588,13 @@ dpif_set_support(struct dpif_backer_support *rt_support,
 
     if (field->type == DPIF_SUPPORT_FIELD_bool) {
         if (!strcasecmp(value, "true")) {
-            if (*(bool *)field->bt_ptr) {
-                *(bool *)field->rt_ptr = true;
+            if (*(bool *) field->bt_ptr || force) {
+                if (force) {
+                    VLOG_WARN(
+                        "Enabling an unsupported feature is very dangerous"
+                    );
+                }
+                *(bool *) field->rt_ptr = true;
                 changed = true;
             } else {
                 ds_put_cstr(ds, "Can not enable features not supported by the datapth");
@@ -6344,19 +6628,108 @@ done:
     return changed;
 }
 
-static void
-dpif_show_backer(const struct dpif_backer *backer, struct ds *ds)
+static struct json *
+dpif_show_backer_json(struct json *backers, const struct dpif_backer *backer)
 {
+    struct json *json_backer = json_object_create();
+
+    /* Add datapath as new JSON object using its name as key. */
+    json_object_put(backers, dpif_name(backer->dpif), json_backer);
+
+    /* Add datapath's stats under "stats" key. */
+    struct json *json_dp_stats = json_object_create();
+    struct dpif_dp_stats dp_stats;
+
+    dpif_get_dp_stats(backer->dpif, &dp_stats);
+    json_object_put_format(json_dp_stats, "hit", "%"PRIu64, dp_stats.n_hit);
+    json_object_put_format(json_dp_stats, "missed", "%"PRIu64,
+                           dp_stats.n_missed);
+    json_object_put(json_backer, "stats", json_dp_stats);
+
+    /* Add datapath's bridges under "bridges" key. */
+    struct json *json_dp_bridges = json_object_create();
+
+    struct shash ofproto_shash = SHASH_INITIALIZER(&ofproto_shash);
+    free(get_ofprotos(&ofproto_shash));
+
+    struct shash_node *node;
+    SHASH_FOR_EACH (node, &ofproto_shash) {
+        struct ofproto_dpif *ofproto = node->data;
+
+        if (ofproto->backer != backer) {
+            continue;
+        }
+
+        /* Add bridge to "bridges" dictionary using its name as key. */
+        struct json *json_ofproto = json_object_create();
+
+        /* Add bridge ports to the current bridge dictionary. */
+        const struct shash_node *port;
+        SHASH_FOR_EACH (port, &ofproto->up.port_by_name) {
+            /* Add bridge port to a bridge's dict using port name as key. */
+            struct json *json_ofproto_port = json_object_create();
+            struct ofport *ofport = port->data;
+
+            /* Add OpenFlow port associated with a bridge port. */
+            json_object_put_format(json_ofproto_port, "ofport", "%"PRIu32,
+                                   ofport->ofp_port);
+
+            /* Add bridge port number. */
+            odp_port_t odp_port = ofp_port_to_odp_port(ofproto,
+                                                       ofport->ofp_port);
+            if (odp_port != ODPP_NONE) {
+                json_object_put_format(json_ofproto_port, "port_no",
+                                       "%"PRIu32, odp_port);
+            } else {
+                json_object_put_string(json_ofproto_port, "port_no", "none");
+            }
+
+            /* Add type of a bridge port. */
+            json_object_put_string(json_ofproto_port, "type",
+                                   netdev_get_type(ofport->netdev));
+
+            /* Add config entries for a bridge port. */
+
+            struct smap config = SMAP_INITIALIZER(&config);
+
+            if (!netdev_get_config(ofport->netdev, &config)
+                && smap_count(&config)) {
+                struct json *json_port_config = json_object_create();
+                struct smap_node *cfg_node;
+
+                SMAP_FOR_EACH (cfg_node, &config) {
+                    json_object_put_string(json_port_config, cfg_node->key,
+                                           cfg_node->value);
+                }
+                json_object_put(json_ofproto_port, "config", json_port_config);
+            }
+            smap_destroy(&config);
+
+            json_object_put(json_ofproto, netdev_get_name(ofport->netdev),
+                            json_ofproto_port);
+        } /* End of bridge port(s). */
+
+        json_object_put(json_dp_bridges, ofproto->up.name, json_ofproto);
+    } /* End of bridge(s). */
+
+    shash_destroy(&ofproto_shash);
+
+    json_object_put(json_backer, "bridges", json_dp_bridges);
+    return json_backer;
+}
+
+static void
+dpif_show_backer_text(const struct dpif_backer *backer, struct ds *ds)
+{
+    struct shash ofproto_shash = SHASH_INITIALIZER(&ofproto_shash);
     const struct shash_node **ofprotos;
     struct dpif_dp_stats dp_stats;
-    struct shash ofproto_shash;
     size_t i;
 
     dpif_get_dp_stats(backer->dpif, &dp_stats);
     ds_put_format(ds, "%s: hit:%"PRIu64" missed:%"PRIu64"\n",
                   dpif_name(backer->dpif), dp_stats.n_hit, dp_stats.n_missed);
 
-    shash_init(&ofproto_shash);
     ofprotos = get_ofprotos(&ofproto_shash);
     for (i = 0; i < shash_count(&ofproto_shash); i++) {
         struct ofproto_dpif *ofproto = ofprotos[i]->data;
@@ -6412,18 +6785,26 @@ static void
 ofproto_unixctl_dpif_show(struct unixctl_conn *conn, int argc OVS_UNUSED,
                           const char *argv[] OVS_UNUSED, void *aux OVS_UNUSED)
 {
-    struct ds ds = DS_EMPTY_INITIALIZER;
-    const struct shash_node **backers;
-    int i;
+    if (unixctl_command_get_output_format(conn) == UNIXCTL_OUTPUT_FMT_JSON) {
+        struct json *backers = json_object_create();
+        const struct shash_node *backer;
 
-    backers = shash_sort(&all_dpif_backers);
-    for (i = 0; i < shash_count(&all_dpif_backers); i++) {
-        dpif_show_backer(backers[i]->data, &ds);
+        SHASH_FOR_EACH (backer, &all_dpif_backers) {
+            dpif_show_backer_json(backers, backer->data);
+        }
+        unixctl_command_reply_json(conn, backers);
+    } else {
+        const struct shash_node **backers = shash_sort(&all_dpif_backers);
+        struct ds ds = DS_EMPTY_INITIALIZER;
+
+        for (int i = 0; i < shash_count(&all_dpif_backers); i++) {
+            dpif_show_backer_text(backers[i]->data, &ds);
+        }
+        free(backers);
+
+        unixctl_command_reply(conn, ds_cstr(&ds));
+        ds_destroy(&ds);
     }
-    free(backers);
-
-    unixctl_command_reply(conn, ds_cstr(&ds));
-    ds_destroy(&ds);
 }
 
 static void
@@ -6495,7 +6876,7 @@ ofproto_unixctl_dpif_dump_flows(struct unixctl_conn *conn,
             ds_put_cstr(&ds, " ");
         }
         odp_flow_format(f.key, f.key_len, f.mask, f.mask_len,
-                        portno_names, &ds, verbosity);
+                        portno_names, &ds, verbosity, false);
         ds_put_cstr(&ds, ", ");
         dpif_flow_stats_format(&f.stats, &ds);
         ds_put_cstr(&ds, ", actions:");
@@ -6545,10 +6926,19 @@ ofproto_unixctl_dpif_set_dp_features(struct unixctl_conn *conn,
                                      void *aux OVS_UNUSED)
 {
     struct ds ds = DS_EMPTY_INITIALIZER;
-    const char *br = argv[1];
+    struct ofproto_dpif *ofproto;
+    bool changed, force = false;
     const char *name, *value;
-    struct ofproto_dpif *ofproto = ofproto_dpif_lookup_by_name(br);
-    bool changed;
+    const char *br;
+
+    if (argc > 2 && !strcmp(argv[1], "--force")) {
+        force = true;
+        argc--;
+        argv++;
+    }
+
+    br = argv[1];
+    ofproto = ofproto_dpif_lookup_by_name(br);
 
     if (!ofproto) {
         unixctl_command_reply_error(conn, "no such bridge");
@@ -6559,7 +6949,7 @@ ofproto_unixctl_dpif_set_dp_features(struct unixctl_conn *conn,
     value = argc > 3 ? argv[3] : NULL;
     changed = dpif_set_support(&ofproto->backer->rt_support,
                                &ofproto->backer->bt_support,
-                               name, value, &ds);
+                               name, value, force, &ds);
     if (changed) {
         xlate_set_support(ofproto, &ofproto->backer->rt_support);
         udpif_flush(ofproto->backer->udpif);
@@ -6602,7 +6992,8 @@ ofproto_unixctl_init(void)
     unixctl_command_register("dpif/dump-flows",
                              "[-m] [--names | --no-names] bridge", 1, INT_MAX,
                              ofproto_unixctl_dpif_dump_flows, NULL);
-    unixctl_command_register("dpif/set-dp-features", "bridge", 1, 3 ,
+    unixctl_command_register("dpif/set-dp-features",
+                             "[--force] bridge [feature [value]]", 1, 4,
                              ofproto_unixctl_dpif_set_dp_features, NULL);
 }
 
@@ -6680,7 +7071,8 @@ ofproto_dpif_add_internal_flow(struct ofproto_dpif *ofproto,
 
     rule = rule_dpif_lookup_in_table(ofproto,
                                      ofproto_dpif_get_tables_version(ofproto),
-                                     TBL_INTERNAL, &match->flow, &match->wc);
+                                     TBL_INTERNAL, &match->flow, &match->wc,
+                                     NULL);
     if (rule) {
         *rulep = &rule->up;
     } else {
@@ -6865,6 +7257,7 @@ const struct ofproto_class ofproto_dpif_class = {
     set_sflow,
     set_ipfix,
     get_ipfix_stats,
+    set_local_sample,
     set_cfm,
     cfm_status_changed,
     get_cfm_status,
@@ -6914,4 +7307,6 @@ const struct ofproto_class ofproto_dpif_class = {
     ct_flush,                   /* ct_flush */
     ct_set_zone_timeout_policy,
     ct_del_zone_timeout_policy,
+    ct_zone_limit_update,
+    ct_zone_limit_protection_update,
 };

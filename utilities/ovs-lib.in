@@ -70,7 +70,7 @@ ovs_ctl () {
     esac
 }
 
-VERSION='@VERSION@'
+VERSION='@VERSION@@VERSION_SUFFIX@'
 
 DAEMON_CWD=/
 
@@ -234,6 +234,10 @@ start_daemon () {
     # If umask was set, turn umask value to previous value.
     if [ -n "$umask" ]; then
         umask "$previuos_umask_value"
+    fi
+
+    if test X"$OOM_SCORE" != X; then
+        echo "$OOM_SCORE" > /proc/`cat $rundir/$daemon.pid`/oom_score_adj 2>/dev/null
     fi
 
     if test X"$strace" != X; then

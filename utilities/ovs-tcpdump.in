@@ -47,7 +47,7 @@ try:
     from ovs.fatal_signal import add_hook
 except Exception:
     print("ERROR: Please install the correct Open vSwitch python support")
-    print("       libraries (version @VERSION@).")
+    print("       libraries (version @VERSION@@VERSION_SUFFIX@).")
     print("       Alternatively, check that your PYTHONPATH is pointing to")
     print("       the correct location.")
     sys.exit(1)
@@ -142,6 +142,7 @@ The following options are available:
    --mirror-to                The name for the mirror port to use (optional)
                               Default 'miINTERFACE'
    --span                     If specified, mirror all ports (optional)
+   --filter                   Set an OpenFlow formatted preselection filter
 """ % {'prog': sys.argv[0]})
     sys.exit(0)
 
@@ -354,13 +355,16 @@ class OVSDB(object):
         return result
 
     def bridge_mirror(self, intf_name, mirror_intf_name, br_name,
-                      mirror_select_all=False):
+                      mirror_select_all=False, mirror_filter=None):
 
         txn = self._start_txn()
         mirror = txn.insert(self.get_table('Mirror'))
         mirror.name = 'm_%s' % intf_name
 
         mirror.select_all = mirror_select_all
+
+        if mirror_filter is not None:
+            mirror.filter = mirror_filter
 
         mirrored_port = self._find_row_by_name('Port', intf_name)
 
@@ -445,6 +449,7 @@ def main():
     mirror_interface = None
     mirror_select_all = False
     dump_cmd = 'tcpdump'
+    mirror_filter = None
 
     for cur, nxt in argv_tuples(sys.argv[1:]):
         if skip_next:
@@ -453,7 +458,7 @@ def main():
         if cur in ['-h', '--help']:
             usage()
         elif cur in ['-V', '--version']:
-            print("ovs-tcpdump (Open vSwitch) @VERSION@")
+            print("ovs-tcpdump (Open vSwitch) @VERSION@@VERSION_SUFFIX@")
             sys.exit(0)
         elif cur in ['--db-sock']:
             db_sock = nxt
@@ -473,6 +478,10 @@ def main():
             continue
         elif cur in ['--span']:
             mirror_select_all = True
+            continue
+        elif cur in ['--filter']:
+            mirror_filter = nxt
+            skip_next = True
             continue
         tcpdargs.append(cur)
 
@@ -526,7 +535,7 @@ def main():
         ovsdb.make_port(mirror_interface, ovsdb.port_bridge(interface))
         ovsdb.bridge_mirror(interface, mirror_interface,
                             ovsdb.port_bridge(interface),
-                            mirror_select_all)
+                            mirror_select_all, mirror_filter=mirror_filter)
     except OVSDBException as oe:
         print("ERROR: Unable to properly setup the mirror: %s." % str(oe))
         sys.exit(1)
@@ -534,29 +543,19 @@ def main():
     ovsdb.close_idl()
 
     pipes = _doexec(*([dump_cmd, '-i', mirror_interface] + tcpdargs))
+    while pipes.poll() is None:
+        data = pipes.stdout.readline().strip(b'\n')
+        if len(data) == 0:
+            break
+        print(data.decode('utf-8'))
+
     try:
-        while pipes.poll() is None:
-            data = pipes.stdout.readline().strip(b'\n')
-            if len(data) == 0:
-                raise KeyboardInterrupt
-            print(data.decode('utf-8'))
-        raise KeyboardInterrupt
-    except KeyboardInterrupt:
-        # If there is a pipe behind ovs-tcpdump (such as ovs-tcpdump
-        # -i eth0 | grep "192.168.1.1"), the pipe is no longer available
-        # after received Ctrl+C.
-        # If we write data to an unavailable pipe, a pipe error will be
-        # reported, so we turn off stdout to avoid subsequent flushing
-        # of data into the pipe.
-        try:
-            sys.stdout.close()
-        except IOError:
-            pass
+        sys.stdout.close()
+    except IOError:
+        pass
 
-        if pipes.poll() is None:
-            pipes.terminate()
-
-    sys.exit(0)
+    if pipes.poll() is None:
+        pipes.terminate()
 
 
 if __name__ == '__main__':

@@ -408,7 +408,8 @@ parse_ethertype(const void **datap, size_t *sizep)
 static inline bool
 parse_icmpv6(const void **datap, size_t *sizep,
              const struct icmp6_data_header *icmp6,
-             ovs_be32 *rso_flags, const struct in6_addr **nd_target,
+             ovs_be32 *rso_flags,
+             const union ovs_16aligned_in6_addr **nd_target,
              struct eth_addr arp_buf[2], uint8_t *opt_type)
 {
     if (icmp6->icmp6_base.icmp6_code != 0 ||
@@ -1054,9 +1055,7 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
                     } else if (dl_type == htons(ETH_TYPE_IPV6)) {
                         dp_packet_update_rss_hash_ipv6_tcp_udp(packet);
                     }
-                    dp_packet_ol_l4_csum_check_partial(packet, packet->l4_ofs,
-                                                 offsetof(struct tcp_header,
-                                                          tcp_csum));
+                    dp_packet_ol_l4_csum_check_partial(packet);
                     if (dp_packet_l4_checksum_good(packet)
                         || dp_packet_ol_l4_csum_partial(packet)) {
                         dp_packet_hwol_set_csum_tcp(packet);
@@ -1076,9 +1075,7 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
                 } else if (dl_type == htons(ETH_TYPE_IPV6)) {
                     dp_packet_update_rss_hash_ipv6_tcp_udp(packet);
                 }
-                dp_packet_ol_l4_csum_check_partial(packet, packet->l4_ofs,
-                                             offsetof(struct udp_header,
-                                                      udp_csum));
+                dp_packet_ol_l4_csum_check_partial(packet);
                 if (dp_packet_l4_checksum_good(packet)
                     || dp_packet_ol_l4_csum_partial(packet)) {
                     dp_packet_hwol_set_csum_udp(packet);
@@ -1092,9 +1089,7 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
                 miniflow_push_be16(mf, tp_dst, sctp->sctp_dst);
                 miniflow_push_be16(mf, ct_tp_src, ct_tp_src);
                 miniflow_push_be16(mf, ct_tp_dst, ct_tp_dst);
-                dp_packet_ol_l4_csum_check_partial(packet, packet->l4_ofs,
-                                             offsetof(struct sctp_header,
-                                                      sctp_csum));
+                dp_packet_ol_l4_csum_check_partial(packet);
                 if (dp_packet_l4_checksum_good(packet)
                     || dp_packet_ol_l4_csum_partial(packet)) {
                     dp_packet_hwol_set_csum_sctp(packet);
@@ -1123,7 +1118,7 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
             }
         } else if (OVS_LIKELY(nw_proto == IPPROTO_ICMPV6)) {
             if (OVS_LIKELY(size >= sizeof(struct icmp6_data_header))) {
-                const struct in6_addr *nd_target;
+                const union ovs_16aligned_in6_addr *nd_target;
                 struct eth_addr arp_buf[2];
                 /* This will populate whether we received Option 1
                  * or Option 2. */
@@ -1192,7 +1187,7 @@ parse_dl_type(const void **datap, size_t *sizep, ovs_be16 *first_vlan_tci_p)
  * If 'packet' is not an Ethernet packet embedding TCP, returns 0.
  * 'dl_type_p' will be set only if the 'packet' is an Ethernet packet.
  * 'nw_frag_p' will be set only if the 'packet' is an IP packet.
- * 'first_vlan_tci' will be set only if the 'packet' contains vlan header.
+ * 'first_vlan_tci_p' will be set only if the 'packet' contains vlan header.
  *
  * The caller must ensure that 'packet' is at least ETH_HEADER_LEN bytes
  * long.'*/
@@ -3278,7 +3273,7 @@ packet_expand(struct dp_packet *p, const struct flow *flow, size_t size)
             if (dp_packet_hwol_tx_ip_csum(p)) {
                 dp_packet_ol_reset_ip_csum_good(p);
             } else {
-                dp_packet_ip_set_header_csum(p);
+                dp_packet_ip_set_header_csum(p, false);
                 dp_packet_ol_set_ip_csum_good(p);
             }
             pseudo_hdr_csum = packet_csum_pseudoheader(ip);
@@ -3306,6 +3301,8 @@ packet_expand(struct dp_packet *p, const struct flow *flow, size_t size)
  * (This is useful only for testing, obviously, and the packet isn't really
  * valid.  Lots of fields are just zeroed.)
  *
+ * If 'bad_csum' is true, the final IP checksum is invalid.
+ *
  * For packets whose protocols can encapsulate arbitrary L7 payloads, 'l7' and
  * 'l7_len' determine that payload:
  *
@@ -3318,7 +3315,7 @@ packet_expand(struct dp_packet *p, const struct flow *flow, size_t size)
  *      from 'l7'. */
 void
 flow_compose(struct dp_packet *p, const struct flow *flow,
-             const void *l7, size_t l7_len)
+             const void *l7, size_t l7_len, bool bad_csum)
 {
     /* Add code to this function (or its callees) for emitting new fields or
      * protocols.  (This isn't essential, so it can be skipped for initial
@@ -3370,7 +3367,18 @@ flow_compose(struct dp_packet *p, const struct flow *flow,
         /* Checksum has already been zeroed by put_zeros call. */
         ip->ip_csum = csum(ip, sizeof *ip);
 
-        dp_packet_ol_set_ip_csum_good(p);
+        if (bad_csum) {
+            /*
+             * Internet checksum is a sum complement to zero, so any other
+             * value will result in an invalid checksum. Here, we flip one
+             * bit.
+             */
+            ip->ip_csum ^= (OVS_FORCE ovs_be16) 0x1;
+            dp_packet_ip_checksum_bad(p);
+        } else {
+            dp_packet_ol_set_ip_csum_good(p);
+        }
+
         pseudo_hdr_csum = packet_csum_pseudoheader(ip);
         flow_compose_l4_csum(p, flow, pseudo_hdr_csum);
     } else if (flow->dl_type == htons(ETH_TYPE_IPV6)) {
@@ -3412,6 +3420,24 @@ flow_compose(struct dp_packet *p, const struct flow *flow,
             put_16aligned_be32(&arp->ar_tpa, flow->nw_dst);
             arp->ar_sha = flow->arp_sha;
             arp->ar_tha = flow->arp_tha;
+        }
+    } else if (flow->dl_type == htons(ETH_TYPE_NSH)) {
+        struct nsh_hdr *nsh;
+
+        nsh = dp_packet_put_zeros(p, sizeof *nsh);
+        dp_packet_set_l3(p, nsh);
+
+        nsh_set_flags_ttl_len(nsh, flow->nsh.flags, flow->nsh.ttl,
+                              flow->nsh.mdtype == NSH_M_TYPE1
+                              ? NSH_M_TYPE1_LEN : NSH_BASE_HDR_LEN);
+        nsh->next_proto = flow->nsh.np;
+        nsh->md_type = flow->nsh.mdtype;
+        put_16aligned_be32(&nsh->path_hdr, flow->nsh.path_hdr);
+
+        if (flow->nsh.mdtype == NSH_M_TYPE1) {
+            for (size_t i = 0; i < 4; i++) {
+                put_16aligned_be32(&nsh->md1.context[i], flow->nsh.context[i]);
+            }
         }
     }
 

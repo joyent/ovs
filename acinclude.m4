@@ -163,10 +163,10 @@ dnl Configure Linux tc compat.
 AC_DEFUN([OVS_CHECK_LINUX_TC], [
   AC_COMPILE_IFELSE([
     AC_LANG_PROGRAM([#include <linux/pkt_cls.h>], [
-        int x = TCA_ACT_FLAGS_SKIP_HW;
+        int x = TCA_FLOWER_KEY_ENC_FLAGS_MASK;
     ])],
-    [AC_DEFINE([HAVE_TCA_ACT_FLAGS_SKIP_HW], [1],
-               [Define to 1 if TCA_ACT_FLAGS_SKIP_HW is available.])])
+    [AC_DEFINE([HAVE_TCA_FLOWER_KEY_ENC_FLAGS_MASK], [1],
+               [Define to 1 if TCA_FLOWER_KEY_ENC_FLAGS_MASK is available.])])
 
   AC_CHECK_MEMBERS([struct tcf_t.firstuse], [], [], [#include <linux/pkt_cls.h>])
 
@@ -193,10 +193,10 @@ AC_DEFUN([OVS_CHECK_LINUX_TC], [
 
   AC_COMPILE_IFELSE([
     AC_LANG_PROGRAM([#include <linux/tc_act/tc_tunnel_key.h>], [
-        int x = TCA_TUNNEL_KEY_ENC_OPTS_VXLAN;
+        int x = TCA_TUNNEL_KEY_NO_FRAG;
     ])],
-    [AC_DEFINE([HAVE_TCA_TUNNEL_KEY_ENC_OPTS_VXLAN], [1],
-               [Define to 1 if TCA_TUNNEL_KEY_ENC_OPTS_VXLAN is available.])])
+    [AC_DEFINE([HAVE_TCA_TUNNEL_KEY_NO_FRAG], [1],
+               [Define to 1 if TCA_TUNNEL_KEY_NO_FRAG is available.])])
 
   AC_COMPILE_IFELSE([
     AC_LANG_PROGRAM([#include <linux/tc_act/tc_pedit.h>], [
@@ -495,6 +495,19 @@ AC_DEFUN([OVS_CHECK_DPDK], [
   fi
 
   AM_CONDITIONAL([DPDK_NETDEV], test "$DPDKLIB_FOUND" = true)
+])
+
+dnl Append a version suffix.
+
+AC_DEFUN([OVS_CHECK_VERSION_SUFFIX], [
+  AC_ARG_WITH([version-suffix],
+              [AS_HELP_STRING([--with-version-suffix=ver_suffix],
+                              [Specify a string that will be appended
+                               to OVS version])])
+  AC_DEFINE_UNQUOTED([VERSION_SUFFIX], ["$with_version_suffix"],
+                     [Package version suffix])
+  AC_SUBST([VERSION_SUFFIX], [$with_version_suffix])
+  ])
 ])
 
 dnl Checks for net/if_dl.h.

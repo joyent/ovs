@@ -28,6 +28,8 @@
 %bcond_with dpdk
 # To disable AF_XDP support, specify '--without afxdp' when building
 %bcond_without afxdp
+# To control the USDT support
+%bcond_without usdt
 
 # If there is a need to automatically enable the package after installation,
 # specify the "--with autoenable"
@@ -71,11 +73,14 @@ BuildRequires: libcap-ng libcap-ng-devel
 %endif
 %if %{with dpdk}
 BuildRequires: libpcap-devel numactl-devel
-BuildRequires: dpdk-devel >= 22.11
+BuildRequires: dpdk-devel >= 24.11
 Provides: %{name}-dpdk = %{version}-%{release}
 %endif
 %if %{with afxdp}
 BuildRequires: libxdp-devel libbpf-devel numactl-devel
+%endif
+%if %{with usdt}
+BuildRequires: libbpf-devel systemtap-sdt-devel
 %endif
 BuildRequires: unbound unbound-devel
 
@@ -113,7 +118,14 @@ Summary: Open vSwitch python3 bindings
 License: ASL 2.0
 BuildArch: noarch
 Requires: python3
-Suggests: python3-netaddr python3-pyparsing python3-unbound
+
+# DNS resolution support in Python IDL.
+Suggests: python3-unbound
+# Dependencies of ovs.flow library.
+Suggests: python3-netaddr python3-pyparsing
+# Dependencies of ovs-flowviz.
+Suggests: python3-click python3-graphviz python3-rich
+
 %{?python_provide:%python_provide python3-openvswitch = %{version}-%{release}}
 
 %description -n python3-openvswitch
@@ -174,10 +186,14 @@ This package provides IPsec tunneling support for OVS tunnels.
 %else
         --disable-afxdp \
 %endif
+%if %{with usdt}
+        --enable-usdt-probes \
+%endif
         --enable-ssl \
         --disable-static \
         --enable-shared \
         --with-pkidir=%{_sharedstatedir}/openvswitch/pki \
+        --with-version-suffix=-%{release} \
         PYTHON3=%{__python3}
 
 build-aux/dpdkstrip.py \
@@ -235,6 +251,9 @@ install -p -m 0755 rhel/etc_sysconfig_network-scripts_ifup-ovs \
 install -d -m 0755 $RPM_BUILD_ROOT%{python3_sitelib}
 cp -a $RPM_BUILD_ROOT/%{_datadir}/openvswitch/python/* \
    $RPM_BUILD_ROOT%{python3_sitelib}
+
+mv $RPM_BUILD_ROOT%{python3_sitelib}/ovs/flowviz/ovs-flowviz \
+   $RPM_BUILD_ROOT/%{_bindir}/ovs-flowviz
 
 rm -rf $RPM_BUILD_ROOT/%{_datadir}/openvswitch/python/
 
@@ -389,6 +408,8 @@ fi
 %{_datadir}/selinux/packages/%{name}/openvswitch-custom.pp
 
 %files -n python3-openvswitch
+%{_bindir}/ovs-flowviz
+%{_mandir}/man8/ovs-flowviz.8*
 %{python3_sitelib}/ovs
 
 %files test

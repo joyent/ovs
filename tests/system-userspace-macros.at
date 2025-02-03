@@ -298,6 +298,14 @@ AT_CHECK([ovs-appctl dpctl/ipf-get-status -m | FORMAT_FRAG_LIST()], [], [dnl
 ])
 ])
 
+# OVS_CHECK_FRAG_LARGE()
+#
+# The userspace needs to check that ipf larger fragments have occurred.
+m4_define([OVS_CHECK_FRAG_LARGE],
+[
+    OVS_WAIT_UNTIL([grep -Eq 'Unsupported big reassembled (v4|v6) packet' ovs-vswitchd.log])
+])
+
 # OVS_CHECK_MIN_KERNEL([minversion], [maxversion])
 #
 # The userspace skips all tests that check kernel version.
@@ -354,6 +362,22 @@ m4_define([CHECK_NO_TC_OFFLOAD])
 #
 # The userspace datapath does not support bareudp tunnels.
 m4_define([OVS_CHECK_BAREUDP],
+[
+    AT_SKIP_IF([:])
+])
+
+# CHECK_EXTERNAL_CT()
+#
+# The userspace datapath does not support external ct.
+m4_define([CHECK_EXTERNAL_CT],
+[
+    AT_SKIP_IF([:])
+])
+
+# ADD_EXTERNAL_CT()
+#
+# The userspace datapath does not support external ct.
+m4_define([ADD_EXTERNAL_CT],
 [
     AT_SKIP_IF([:])
 ])

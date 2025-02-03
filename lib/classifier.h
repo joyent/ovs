@@ -165,12 +165,11 @@
  * separate tries for subsets of rules separated by metadata fields.
  *
  * Prefix tracking is configured via OVSDB "Flow_Table" table,
- * "fieldspec" column.  "fieldspec" is a string map where a "prefix"
- * key tells which fields should be used for prefix tracking.  The
- * value of the "prefix" key is a comma separated list of field names.
+ * "prefixes" column.  "prefixes" is a string set where each element
+ * is a name of a field that should be used for prefix tracking.
  *
  * There is a maximum number of fields that can be enabled for any one
- * flow table.  Currently this limit is 3.
+ * flow table.  Currently this limit is 4.
  *
  *
  * Partitioning (Lookup Time and Wildcard Optimization)
@@ -299,6 +298,7 @@
  * parallel to the rule's removal. */
 
 #include "cmap.h"
+#include "hmapx.h"
 #include "openvswitch/match.h"
 #include "openvswitch/meta-flow.h"
 #include "pvector.h"
@@ -327,7 +327,7 @@ struct cls_trie {
 
 enum {
     CLS_MAX_INDICES = 3,   /* Maximum number of lookup indices per subtable. */
-    CLS_MAX_TRIES = 3      /* Maximum number of prefix trees per classifier. */
+    CLS_MAX_TRIES = 4,     /* Maximum number of prefix trees per classifier. */
 };
 
 /* A flow classifier. */
@@ -398,7 +398,8 @@ static inline void classifier_publish(struct classifier *);
  * and each other. */
 const struct cls_rule *classifier_lookup(const struct classifier *,
                                          ovs_version_t, struct flow *,
-                                         struct flow_wildcards *);
+                                         struct flow_wildcards *,
+                                         struct hmapx *conj_flows);
 bool classifier_rule_overlaps(const struct classifier *,
                               const struct cls_rule *, ovs_version_t);
 const struct cls_rule *classifier_find_rule_exactly(const struct classifier *,

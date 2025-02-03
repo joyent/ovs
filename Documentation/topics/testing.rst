@@ -343,17 +343,22 @@ To see a list of all the available tests, run::
 
 These tests support a `DPDK supported NIC`_. The tests operate on a wider set of
 environments, for instance, when a virtual port is used.
-They do require proper DPDK variables (``DPDK_DIR`` and ``DPDK_BUILD``).
 Moreover you need to have root privileges to load the required modules and to bind
-the NIC to the DPDK-compatible driver.
+a PCI device to the DPDK-compatible driver.
 
 .. _DPDK supported NIC: https://core.dpdk.org/supported/#nics
 
+The phy test will skip if no suitable PCI device is found.
+It is possible to select which PCI device is used for this test by setting the
+DPDK_PCI_ADDR environment variable, which is especially useful when testing
+with a mlx5 device::
+
+    # DPDK_PCI_ADDR=0000:82:00.0 make check-dpdk
+
 All tests are skipped if no hugepages are configured. User must look into the DPDK
 manual to figure out how to `Configure hugepages`_.
-The phy test will skip if no compatible physical device is available.
 
-.. _Configure hugepages: https://doc.dpdk.org/guides-22.11/linux_gsg/sys_reqs.html
+.. _Configure hugepages: https://doc.dpdk.org/guides-24.11/linux_gsg/sys_reqs.html
 
 All the features documented under `Unit Tests`_ are available for the DPDK
 testsuite.
@@ -404,7 +409,7 @@ options are used::
     checking whether actions Autovalidator is default implementation... yes
 
 Compile OVS in debug mode to have `ovs_assert` statements error out if
-there is a mis-match in the datapath classifier lookup or packet parser
+there is a mismatch in the datapath classifier lookup or packet parser
 implementations.
 
 Since the AVX512 implementation of the datapath interface is disabled by
@@ -474,20 +479,21 @@ You should invoke scan-view to view analysis results. The last line of output
 from ``clang-analyze`` will list the command (containing results directory)
 that you should invoke to view the results on a browser.
 
-vsperf
-------
+ViNePerf
+--------
 
-The vsperf project aims to develop a vSwitch test framework that can be used to
-validate the suitability of different vSwitch implementations in a telco
-deployment environment. More information can be found on the `OPNFV wiki`_.
+The ViNePerf project, formerly known as VswitchPerf or vsperf, aims to
+develop a vSwitch test framework that can be used to validate the
+suitability of different vSwitch implementations in a telco deployment
+environment. More information can be found on the `Anuket project wiki`_.
 
-.. _OPNFV wiki: https://wiki.opnfv.org/display/vsperf/VSperf+Home
+.. _Anuket project wiki: https://wiki.anuket.io/display/HOME/ViNePERF
 
 Proof of Concepts
 ~~~~~~~~~~~~~~~~~
 
 Proof of Concepts are documentation materialized into Ansible recipes
-executed in VirtualBox or Libvirt environments orchastrated by Vagrant.
+executed in VirtualBox or Libvirt environments orchestrated by Vagrant.
 Proof of Concepts allow developers to create small virtualized setups that
 demonstrate how certain Open vSwitch features are intended to work avoiding
 user introduced errors by overlooking instructions.  Proof of Concepts

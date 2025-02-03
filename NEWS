@@ -1,4 +1,134 @@
-Post-v3.2.0
+Post-v3.5.0
+--------------------
+   - DPDK:
+     * New debug appctl command 'dpdk/get-memzone-stats'.
+   - ovs-ctl:
+     * Added a new option, --oom-score=<score>, to set the daemons' Linux
+       Out-Of-Memory (OOM) killer score.
+
+
+v3.5.0 - xx xxx xxxx
+--------------------
+   - The limit on the number of fields for address prefix tracking in flow
+     tables increased from 3 to 4.  For example, it is now possible to
+     specify both IPv4 and IPv6 address fields at the same time:
+      $ ovs-vsctl set Bridge br0 flow_tables:123=@N -- \
+          --id=@N create Flow_Table \
+                    name=table123 prefixes=nw_dst,nw_src,ipv6_dst,ipv6_src
+   - Address prefix tracking is now enabled by default for both IPv4 and IPv6
+     address fields: nw_dst, nw_src, ipv6_dst and ipv6_src.
+     This allows to significantly reduce amount of datapath flows generated
+     from mixed IPv4+IPv6 flow tables.
+   - SSL/TLS:
+     * TLSv1 and TLSv1.1 protocols are deprecated and disabled by default
+       on OpenFlow and database connections.  Use --ssl-protocols to turn
+       them back on.  Support will be fully removed in the next release.
+     * OpenSSL 1.1.1 or newer is now required for SSL/TLS support.
+     * The protocol list in --ssl-protocols or corresponding database column
+       now supports specifying simple protocol ranges like:
+         - "TLSv1-TLSv1.2" to enable all protocols between TLSv1 and TLSv1.2.
+         - "TLSv1.2+" to enable protocol TLSv1.2 and later.
+       The value must be a list of protocols or exactly one protocol range.
+     * Added explicit support for TLSv1.3.  It can now be enabled via
+       --ssl-protocols (TLSv1.3 was supported in earlier versions only when
+       this option was not set).  TLS ciphersuites for TLSv1.3 and later can
+       be configured via --ssl-ciphersuites (--ssl-ciphers only applies to
+       TLSv1.2 and earlier).
+     * ovs-pki now generates 3072-bit keys by default.
+   - Userspace datapath:
+     * The default zone limit, if set, is now inherited by any zone
+       that does not have a specific value defined, rather than being
+       treated as a global value, aligning the behavior with that of
+       the kernel datapath.
+     * Extended the support for TSO software fallback to include support for
+       VXLAN, Geneve, and GRE tunneled packets.
+   - Linux TC offload:
+     * Add support for matching tunnel flags if the kernel supports it.
+     * Add support for the "Don't Fragment" (DF) flag in the encap action,
+       if the kernel supports it.
+   - Python:
+     * Added tool called "ovs-flowviz" capable of parsing OpenFlow
+       and datapath flow dumps and displaying them in several different
+       formats.
+     * Dropped support for Python < 3.7.
+   - DPDK:
+     * Add support for DPDK 24.11.1.
+     * Add hardware offload support for matching ICMPv6 protocol
+       (experimental).
+   - Tunnels:
+     * LISP and STT tunnel port types are deprecated and will be removed in
+       the next release.
+   - IPsec:
+     * New option '--root-ipsec-conf' for ovs-monitor-ipsec with Libreswan
+       to allow cases where '--ipsec-conf' is not the main ipsec.conf, but
+       included from it.  The value should be the path to the main ipsec.conf.
+     * New option '--use-default-crypto' for ovs-monitor-ipsec with Libreswan
+       to make it not configure any crypto options (ike/esp) for connections.
+       Most useful in combination with '--root-ipsec-conf' where system-wide
+       crypto-policy is included from the root ipsec.conf.
+     * New option '--ovs-monitor-ipsec-options' for 'ovs-ctl start-ovs-ipsec'
+       to pass above new options to ovs-monitor-ipsec.
+
+
+v3.4.0 - 15 Aug 2024
+--------------------
+   - Option '--mlockall' now only locks memory pages on fault, if possible.
+     This also makes it compatible with vHost Post-copy Live Migration.
+   - ovs-appctl:
+     * Added new option [-f|--format] to choose the output format, e.g. 'json'
+       or 'text' (by default).
+     * Added new option [--pretty] to print JSON output in a readable fashion.
+     * 'dpif/show' and 'list-commands' now support output in JSON format.
+     * Added 'ofproto/detrace' command that outputs the set of OpenFlow rules
+       and groups that contributed to the creation of a specific datapath flow.
+   - ovs-vsctl:
+     * Added a new filter column in the Mirror table which can be used to
+       apply filters to mirror ports.
+   - ovs-tcpdump:
+     * Added command line parameter --filter to enable filtering the packets
+       that are captured by tcpdump.
+   - Userspace datapath:
+     * Conntrack now supports 'random' flag for selecting ports in a range
+       while natting and 'persistent' flag for selection of the IP address
+       from a range.
+     * IPv6 UDP tunnel encapsulation including Geneve and VXLAN will now
+       honour the csum option.  Configuring the interface with
+       "options:csum=false" now has the same effect as the udp6zerocsumtx
+       option has with Linux kernel UDP tunnels.
+   - The primary development branch has been renamed from 'master' to 'main'.
+     The OVS tree remains hosted on GitHub.
+     https://github.com/openvswitch/ovs.git
+   - DPDK:
+     * OVS validated with DPDK 23.11.1.
+     * Link status changes are now handled via interrupt mode if the DPDK
+       driver supports it.  It is possible to revert to polling mode by setting
+       per interface 'options:dpdk-lsc-interrupt' to 'false'.
+   - Python:
+     * Added custom transaction support to the Idl via add_op().
+     * Added support for different output formats like 'json' to Python's
+       unixctl classes.
+   - Tunnels:
+     * Previously the kernel datapath did not enable UDP checksums by default
+       in IPv6 tunnels.  This behaviour is non-standard, differs from the
+       Linux kernel, and as also different than the userspace datapath.  Now
+       these tunnels will calculate checksums by default and that behaviour can
+       be changed with "options:csum=false" just as with the userspace
+       datapath.
+   - Local sampling is introduced.  It reuses the OpenFlow sample action and
+     allows samples to be emitted locally (instead of via IPFIX) in a
+     datapath-specific manner.  The Linux kernel datapath is the first to
+     support this feature by using the new datapath 'psample' action.  See
+     'local-group-id' column in the Flow_Sample_Collector_Set table.
+   - A new configuration knob 'other-config:explicit-sampled-drops' in the
+     Open_vSwitch table controls whether an explicit drop action shall be
+     added at the end of datapath flows whose last action is an
+     observability-driven sample action.
+   - OpenFlow:
+     * A new version of the 'sample' action (NXAST_SAMPLE4) is introduced
+       that allows use of subfields in 'obs_point_id' and 'obs_domain_id'.
+
+
+v3.3.0 - 16 Feb 2024
 --------------------
    - OVSDB:
      * Support pre-vote mechanism in RAFT that protects the cluster against
@@ -6,6 +136,49 @@ Post-v3.2.0
        from older version is supported but it may trigger more leader elections
        during the process, and error logs complaining unrecognized fields may
        be observed on old nodes.
+     * New command line option --config-file that allows a fine control over
+       remotes and database configuration, including setting options for
+       connection methods for relays and active-backup replication.
+       For more details see ovsdb-server(1) and ovsdb(7).
+     * Make use of cooperative multitasking to improve maintenance of RAFT
+       cluster during long running processing such as online schema conversion.
+   - OpenFlow:
+     * NXT_CT_FLUSH extension is updated to support flushing connections
+       based on mark and labels.  'ct-flush' command of ovs-ofctl updated
+       to support these new arguments accordingly.
+   - ovs-appctl:
+     * 'ofproto/trace' now reports OpenFlow rules that make up a conjunctive
+       flow match.
+     * Output of 'dpctl/show' command no longer shows interface configuration
+       status, only values of the actual configuration options, a.k.a.
+       'requested' configuration.  The interface configuration status,
+       a.k.a. 'configured' values, can be found in the 'status' column of
+       the Interface table, i.e. with 'ovs-vsctl get interface <..> status'.
+       Reported names adjusted accordingly.
+     * Added support for removal of default CT zone limit, e.g.
+       "ovs-appctl dpctl/ct-del-limits default".
+     * 'dpctl/flush-conntrack' is now capable of flushing connections based
+       on mark and labels.
+     * 'mdb/show': support for multicast snooping to show the protocol
+       responsible for adding/updating the entry.
+   - ovs-vsctl:
+     * New commands 'set-zone-limit', 'del-zone-limit' and 'list-zone-limits'
+       to manage the maximum number of connections in conntrack zones via
+       a new 'limit' column in the 'CT_Zone' database table and
+       'ct_zone_default_limit' column in the 'Datapath' table.
+   - Userspace datapath:
+     * Added support for Generic Segmentation Offloading for the cases where
+       TSO is enabled but not supported by an egress interface (except for
+       tunnel interfaces).
+     * 'pmd-sleep-max' is updated to also accept pmd-thread-core:sleep-max.
+       The existing behaviour is maintained and a non key:value pair value
+       will be applied to all other PMD thread cores.'pmd-sleep-show' is
+       updated to show the maximum sleep for each PMD thread core.
+     * The userspace conntrack module no longer requires the user to specify
+       connection helpers in all flow rules. Instead, the helper specified
+       during connection commit will be used by default.
+   - DPDK:
+     * Add support for DPDK 23.11.
 
 
 v3.2.0 - 17 Aug 2023

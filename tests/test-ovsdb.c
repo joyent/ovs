@@ -1798,7 +1798,7 @@ do_transact_modify(struct ovs_cmdl_context *ctx)
     struct ovsdb_row *row_rw;
 
     row_ro = do_transact_find_row(ctx->argv[1]);
-    row_rw = ovsdb_txn_row_modify(do_transact_txn, row_ro);
+    ovsdb_txn_row_modify(do_transact_txn, row_ro, &row_rw, NULL);
     do_transact_set_i_j(row_rw, ctx->argv[2], ctx->argv[3]);
 }
 
@@ -2024,6 +2024,24 @@ print_idl_row_updated_link2(const struct idltest_link2 *l2, int step)
 }
 
 static void
+print_idl_row_updated_indexed(const struct idltest_indexed *ind, int step)
+{
+    struct ds updates = DS_EMPTY_INITIALIZER;
+
+    for (size_t i = 0; i < IDLTEST_INDEXED_N_COLUMNS; i++) {
+        if (idltest_indexed_is_updated(ind, i)) {
+            ds_put_format(&updates, " %s", idltest_indexed_columns[i].name);
+        }
+    }
+    if (updates.length) {
+        print_and_log("%03d: table %s: updated columns:%s",
+                      step, ind->header_.table->class_->name,
+                      ds_cstr(&updates));
+        ds_destroy(&updates);
+    }
+}
+
+static void
 print_idl_row_updated_simple3(const struct idltest_simple3 *s3, int step)
 {
     struct ds updates = DS_EMPTY_INITIALIZER;
@@ -2173,6 +2191,21 @@ print_idl_row_link2(const struct idltest_link2 *l2, int step, bool terse)
 }
 
 static void
+print_idl_row_indexed(const struct idltest_indexed *ind, int step, bool terse)
+{
+    struct ds msg = DS_EMPTY_INITIALIZER;
+
+    ds_put_format(&msg, "i=%"PRId64, ind->i);
+
+    char *row_msg = format_idl_row(&ind->header_, step, ds_cstr(&msg), terse);
+    print_and_log("%s", row_msg);
+    ds_destroy(&msg);
+    free(row_msg);
+
+    print_idl_row_updated_indexed(ind, step);
+}
+
+static void
 print_idl_row_simple3(const struct idltest_simple3 *s3, int step, bool terse)
 {
     struct ds msg = DS_EMPTY_INITIALIZER;
@@ -2252,6 +2285,7 @@ print_idl_row_singleton(const struct idltest_singleton *sng, int step,
 static void
 print_idl(struct ovsdb_idl *idl, int step, bool terse)
 {
+    const struct idltest_indexed *ind;
     const struct idltest_simple3 *s3;
     const struct idltest_simple4 *s4;
     const struct idltest_simple6 *s6;
@@ -2285,6 +2319,10 @@ print_idl(struct ovsdb_idl *idl, int step, bool terse)
         print_idl_row_simple6(s6, step, terse);
         n++;
     }
+    IDLTEST_INDEXED_FOR_EACH (ind, idl) {
+        print_idl_row_indexed(ind, step, terse);
+        n++;
+    }
     IDLTEST_SINGLETON_FOR_EACH (sng, idl) {
         print_idl_row_singleton(sng, step, terse);
         n++;
@@ -2297,6 +2335,7 @@ print_idl(struct ovsdb_idl *idl, int step, bool terse)
 static void
 print_idl_track(struct ovsdb_idl *idl, int step, bool terse)
 {
+    const struct idltest_indexed *ind;
     const struct idltest_simple3 *s3;
     const struct idltest_simple4 *s4;
     const struct idltest_simple6 *s6;
@@ -2327,6 +2366,10 @@ print_idl_track(struct ovsdb_idl *idl, int step, bool terse)
     }
     IDLTEST_SIMPLE6_FOR_EACH_TRACKED (s6, idl) {
         print_idl_row_simple6(s6, step, terse);
+        n++;
+    }
+    IDLTEST_INDEXED_FOR_EACH (ind, idl) {
+        print_idl_row_indexed(ind, step, terse);
         n++;
     }
 
@@ -2800,6 +2843,13 @@ do_idl(struct ovs_cmdl_context *ctx)
             } else {
                 print_idl(idl, step++, terse);
             }
+
+            /* Just run IDL forever for a simple monitoring. */
+            if (!strcmp(arg, "monitor")) {
+                seqno = ovsdb_idl_get_seqno(idl);
+                i--;
+                continue;
+            }
         }
         seqno = ovsdb_idl_get_seqno(idl);
 
@@ -2970,6 +3020,29 @@ do_idl_partial_update_map_column(struct ovs_cmdl_context *ctx)
     printf("%03d: After trying to delete a deleted element\n", step++);
     dump_simple2(idl, myRow, step++);
 
+    myTxn = ovsdb_idl_txn_create(idl);
+    myRow = idltest_simple2_insert(myTxn);
+    idltest_simple2_update_smap_setkey(myRow, "key3", "myList3");
+    idltest_simple2_set_name(myRow, "String2");
+    idltest_simple2_delete(myRow);
+    ovsdb_idl_txn_commit_block(myTxn);
+    ovsdb_idl_txn_destroy(myTxn);
+    ovsdb_idl_get_initial_snapshot(idl);
+    printf("%03d: After Create element, update smap and Delete element\n",
+           step++);
+    dump_simple2(idl, myRow, step++);
+
+    myTxn = ovsdb_idl_txn_create(idl);
+    myRow = idltest_simple2_first(idl);
+    idltest_simple2_update_smap_setkey(myRow, "key4", "myList4");
+    idltest_simple2_set_name(myRow, "String3");
+    idltest_simple2_delete(myRow);
+    ovsdb_idl_txn_commit_block(myTxn);
+    ovsdb_idl_txn_destroy(myTxn);
+    ovsdb_idl_get_initial_snapshot(idl);
+    printf("%03d: After update smap and Delete element\n", step++);
+    dump_simple2(idl, myRow, step++);
+
     ovsdb_idl_destroy(idl);
     printf("%03d: End test\n", step);
 }
@@ -3068,6 +3141,21 @@ do_idl_partial_update_set_column(struct ovs_cmdl_context *ctx)
     ovsdb_idl_get_initial_snapshot(idl);
     printf("%03d: After add to other table + set of strong ref\n", step++);
     dump_simple3(idl, myRow, step++);
+
+    /* create row, insert key, delete row */
+    myTxn = ovsdb_idl_txn_create(idl);
+    myRow = idltest_simple3_insert(myTxn);
+    uuid_from_string(&uuid_to_add, "12345678-dd3f-4616-ab6a-83a490bb0991");
+    idltest_simple3_update_uset_addvalue(myRow, uuid_to_add);
+    idltest_simple3_set_name(myRow, "String2");
+    idltest_simple3_delete(myRow);
+    ovsdb_idl_txn_commit_block(myTxn);
+    ovsdb_idl_txn_destroy(myTxn);
+    ovsdb_idl_get_initial_snapshot(idl);
+    printf("%03d: After Create element, update set and Delete element\n",
+           step++);
+    dump_simple3(idl, myRow, step++);
+
     ovsdb_idl_destroy(idl);
     printf("%03d: End test\n", step);
 }

@@ -115,7 +115,8 @@ ovs_router_lookup(uint32_t mark, const struct in6_addr *ip6_dst,
         const struct cls_rule *cr_src;
         struct flow flow_src = {.ipv6_dst = *src, .pkt_mark = mark};
 
-        cr_src = classifier_lookup(&cls, OVS_VERSION_MAX, &flow_src, NULL);
+        cr_src = classifier_lookup(&cls, OVS_VERSION_MAX, &flow_src, NULL,
+                                   NULL);
         if (cr_src) {
             struct ovs_router_entry *p_src = ovs_router_entry_cast(cr_src);
             if (!p_src->local) {
@@ -126,7 +127,7 @@ ovs_router_lookup(uint32_t mark, const struct in6_addr *ip6_dst,
         }
     }
 
-    cr = classifier_lookup(&cls, OVS_VERSION_MAX, &flow, NULL);
+    cr = classifier_lookup(&cls, OVS_VERSION_MAX, &flow, NULL, NULL);
     if (cr) {
         struct ovs_router_entry *p = ovs_router_entry_cast(cr);
 
@@ -327,6 +328,20 @@ ovs_router_insert(uint32_t mark, const struct in6_addr *ip_dst, uint8_t plen,
         ovs_router_insert__(mark, priority, local, ip_dst, plen,
                             output_bridge, gw, prefsrc);
     }
+}
+
+/* The same as 'ovs_router_insert', but it adds the route even if updates
+ * from the system routing table are disabled.  Used for unit tests. */
+void
+ovs_router_force_insert(uint32_t mark, const struct in6_addr *ip_dst,
+                        uint8_t plen, bool local, const char output_bridge[],
+                        const struct in6_addr *gw,
+                        const struct in6_addr *prefsrc)
+{
+    uint8_t priority = local ? plen + 64 : plen;
+
+    ovs_router_insert__(mark, priority, local, ip_dst, plen,
+                        output_bridge, gw, prefsrc);
 }
 
 static void

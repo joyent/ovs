@@ -450,6 +450,8 @@ void ofproto_rule_ref(struct rule *);
 bool ofproto_rule_try_ref(struct rule *);
 void ofproto_rule_unref(struct rule *);
 
+void ofproto_rule_stats_ds(struct ds *, struct rule *, bool offload_stats);
+
 static inline const struct rule_actions * rule_get_actions(const struct rule *);
 static inline bool rule_is_table_miss(const struct rule *);
 static inline bool rule_is_hidden(const struct rule *);
@@ -549,6 +551,10 @@ extern unsigned ofproto_offloaded_stats_delay;
 /* Number of upcall handler and revalidator threads. Only affects the
  * ofproto-dpif implementation. */
 extern uint32_t n_handlers, n_revalidators;
+
+/* If an explicit datapath drop action shall be added after trailing sample
+ * actions coming from IPFIX / sFlow / local sampling. */
+extern bool ofproto_explicit_sampled_drops;
 
 static inline struct rule *rule_from_cls_rule(const struct cls_rule *);
 
@@ -1489,6 +1495,15 @@ struct ofproto_class {
         bool bridge_ipfix, struct ovs_list *replies
         );
 
+    /* Configures local sampling on 'ofproto' according to the options array
+     * of 'options' which contains 'n_options' elements.
+     *
+     * EOPNOTSUPP as a return value indicates that 'ofproto' does not support
+     * local sampling. */
+    int (*set_local_sample)(struct ofproto *ofproto,
+                            const struct ofproto_lsample_options *options,
+                            size_t n_options);
+
     /* Configures connectivity fault management on 'ofport'.
      *
      * If 'cfm_settings' is nonnull, configures CFM according to its members.
@@ -1921,6 +1936,19 @@ struct ofproto_class {
     /* Deletes the timeout policy associated with 'zone' in datapath type
      * 'dp_type'. */
     void (*ct_del_zone_timeout_policy)(const char *dp_type, uint16_t zone);
+
+    /* Updates the CT zone limit for specified zone. Setting 'zone' to
+     * 'OVS_ZONE_LIMIT_DEFAULT_ZONE' represents the default zone.
+     * 'NULL' passed as 'limit' indicates that the limit should be removed for
+     * the specified zone. The caller must ensure that the 'limit' value is
+     * within proper range (0 - UINT32_MAX). */
+    void (*ct_zone_limit_update)(const char *dp_type, int32_t zone,
+                                 int64_t *limit);
+
+    /* Sets the CT zone limit protection to "protected" for the specified
+     * datapath type. */
+    void (*ct_zone_limit_protection_update)(const char *dp_type,
+                                            bool protected);
 };
 
 extern const struct ofproto_class ofproto_dpif_class;

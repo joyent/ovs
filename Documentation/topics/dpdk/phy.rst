@@ -117,7 +117,7 @@ tool::
 
 For more information, refer to the `DPDK drivers documentation`_.
 
-.. _DPDK drivers documentation: https://doc.dpdk.org/guides-22.11/linux_gsg/linux_drivers.html
+.. _DPDK drivers documentation: https://doc.dpdk.org/guides-24.11/linux_gsg/linux_drivers.html
 
 .. _dpdk-phy-multiqueue:
 
@@ -148,14 +148,14 @@ situation.
 Some physical NICs can be programmed to put these protocols in a dedicated
 hardware Rx queue using the rte_flow__ API.
 
-__ https://doc.dpdk.org/guides-22.11/prog_guide/rte_flow.html
+__ https://doc.dpdk.org/guides-24.11/prog_guide/rte_flow.html
 
 .. warning::
 
    This feature is not compatible with all NICs. Refer to the DPDK
-   `compatibilty matrix`__ and vendor documentation for more details.
+   `compatibility matrix`__ and vendor documentation for more details.
 
-   __ https://doc.dpdk.org/guides-22.11/nics/overview.html
+   __ https://doc.dpdk.org/guides-24.11/nics/overview.html
 
 Rx steering must be enabled for specific protocols per port. The
 ``rx-steering`` option takes one of the following values:
@@ -198,7 +198,7 @@ Example::
    a dedicated queue, it will be explicit::
 
       $ ovs-vsctl get interface dpdk-p0 status
-      {..., rx_steering=unsupported}
+      {..., rx-steering=unsupported}
 
    More details can often be found in ``ovs-vswitchd.log``::
 
@@ -322,7 +322,7 @@ To hotplug a port with igb_uio in this case, DPDK must be configured to use
 physical addressing for IOVA mode. For more information regarding IOVA modes
 in DPDK please refer to the `DPDK IOVA Mode Detection`__.
 
-__ https://doc.dpdk.org/guides-22.11/prog_guide/env_abstraction_layer.html#iova-mode-detection
+__ https://doc.dpdk.org/guides-24.11/prog_guide/env_abstraction_layer.html#iova-mode-detection
 
 To configure OVS DPDK to use physical addressing for IOVA::
 
@@ -354,7 +354,7 @@ Representors are multi devices created on top of one PF.
 
 For more information, refer to the `DPDK documentation`__.
 
-__ https://doc.dpdk.org/guides-22.11/prog_guide/switch_representation.html#port-representors
+__ https://doc.dpdk.org/guides-24.11/prog_guide/switch_representation.html#port-representors
 
 Prior to port representors there was a one-to-one relationship between the PF
 and the eth device. With port representors the relationship becomes one PF to
@@ -488,7 +488,7 @@ in the ``options`` column of the ``Interface`` table.
    kernel netdevice, and be inherited from it when Open vSwitch is restarted,
    even if the options described in this section are unset from Open vSwitch.
 
-.. _bifurcated drivers: https://doc.dpdk.org/guides-22.11/linux_gsg/linux_drivers.html#bifurcated-driver
+.. _bifurcated drivers: https://doc.dpdk.org/guides-24.11/linux_gsg/linux_drivers.html#bifurcated-driver
 
 - Configure the VF MAC address::
 
@@ -499,7 +499,7 @@ its options::
 
     $ ovs-appctl dpctl/show
     [...]
-      port 3: dpdk-rep0 (dpdk: configured_rx_queues=1, ..., dpdk-vf-mac=00:11:22:33:44:55, ...)
+      port 3: dpdk-rep0 (dpdk: ..., dpdk-vf-mac=00:11:22:33:44:55, ...)
 
     $ ovs-vsctl show
     [...]
@@ -546,8 +546,8 @@ the firmware every time to fulfil this request.
 
 Note that not all PMD drivers support LSC interrupts.
 
-The default configuration is polling mode. To set interrupt mode, option
-``dpdk-lsc-interrupt`` has to be set to ``true``.
+The default configuration is interrupt mode. To set polling mode, option
+``dpdk-lsc-interrupt`` has to be set to ``false``.
 
 Command to set interrupt mode for a specific interface::
     $ ovs-vsctl set interface <iface_name> options:dpdk-lsc-interrupt=true

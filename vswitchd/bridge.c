@@ -157,6 +157,8 @@ struct aa_mapping {
 /* Internal representation of conntrack zone configuration table in OVSDB. */
 struct ct_zone {
     uint16_t zone_id;
+    int64_t limit;              /* Limit of allowed entries. '-1' if not
+                                 * specified. */
     struct simap tp;            /* A map from timeout policy attribute to
                                  * timeout value. */
     struct hmap_node node;      /* Node in 'struct datapath' 'ct_zones'
@@ -168,14 +170,15 @@ struct ct_zone {
 
 /* Internal representation of datapath configuration table in OVSDB. */
 struct datapath {
-    char *type;                 /* Datapath type. */
-    struct hmap ct_zones;       /* Map of 'struct ct_zone' elements, indexed
-                                 * by 'zone'. */
-    struct hmap_node node;      /* Node in 'all_datapaths' hmap. */
-    struct smap caps;           /* Capabilities. */
-    unsigned int last_used;     /* The last idl_seqno that this 'datapath'
-                                 * used in OVSDB. This number is used for
-                                 * garbage collection. */
+    char *type;                     /* Datapath type. */
+    struct hmap ct_zones;           /* Map of 'struct ct_zone' elements,
+                                     * indexed by 'zone'. */
+    struct hmap_node node;          /* Node in 'all_datapaths' hmap. */
+    struct smap caps;               /* Capabilities. */
+    unsigned int last_used;         /* The last idl_seqno that this 'datapath'
+                                     * used in OVSDB. This number is used for
+                                     * garbage collection. */
+    int64_t ct_zone_default_limit;  /* Default CT limit for all zones. */
 };
 
 /* All bridges, indexed by name. */
@@ -285,6 +288,7 @@ static void bridge_configure_mac_table(struct bridge *);
 static void bridge_configure_mcast_snooping(struct bridge *);
 static void bridge_configure_sflow(struct bridge *, int *sflow_bridge_number);
 static void bridge_configure_ipfix(struct bridge *);
+static void bridge_configure_lsample(struct bridge *);
 static void bridge_configure_spanning_tree(struct bridge *);
 static void bridge_configure_tables(struct bridge *);
 static void bridge_configure_dp_desc(struct bridge *);
@@ -662,6 +666,7 @@ ct_zone_alloc(uint16_t zone_id, struct ovsrec_ct_timeout_policy *tp_cfg)
     struct ct_zone *ct_zone = xzalloc(sizeof *ct_zone);
 
     ct_zone->zone_id = zone_id;
+    ct_zone->limit = -1;
     simap_init(&ct_zone->tp);
     get_timeout_policy_from_ovsrec(&ct_zone->tp, tp_cfg);
     return ct_zone;
@@ -670,6 +675,14 @@ ct_zone_alloc(uint16_t zone_id, struct ovsrec_ct_timeout_policy *tp_cfg)
 static void
 ct_zone_remove_and_destroy(struct datapath *dp, struct ct_zone *ct_zone)
 {
+    if (!simap_is_empty(&ct_zone->tp)) {
+        ofproto_ct_del_zone_timeout_policy(dp->type, ct_zone->zone_id);
+    }
+
+    if (ct_zone->limit > -1) {
+        ofproto_ct_zone_limit_update(dp->type, ct_zone->zone_id, NULL);
+    }
+
     hmap_remove(&dp->ct_zones, &ct_zone->node);
     simap_destroy(&ct_zone->tp);
     free(ct_zone);
@@ -706,6 +719,7 @@ datapath_create(const char *type)
 {
     struct datapath *dp = xzalloc(sizeof *dp);
     dp->type = xstrdup(type);
+    dp->ct_zone_default_limit = -1;
     hmap_init(&dp->ct_zones);
     hmap_insert(&all_datapaths, &dp->node, hash_string(type, 0));
     smap_init(&dp->caps);
@@ -722,6 +736,12 @@ datapath_destroy(struct datapath *dp)
             ct_zone_remove_and_destroy(dp, ct_zone);
         }
 
+        if (dp->ct_zone_default_limit > -1) {
+            ofproto_ct_zone_limit_update(dp->type, OVS_ZONE_LIMIT_DEFAULT_ZONE,
+                                         NULL);
+        }
+
+        ofproto_ct_zone_limit_protection_update(dp->type, false);
         hmap_remove(&all_datapaths, &dp->node);
         hmap_destroy(&dp->ct_zones);
         free(dp->type);
@@ -734,6 +754,7 @@ static void
 ct_zones_reconfigure(struct datapath *dp, struct ovsrec_datapath *dp_cfg)
 {
     struct ct_zone *ct_zone;
+    bool protected = false;
 
     /* Add new 'ct_zone's or update existing 'ct_zone's based on the database
      * state. */
@@ -743,29 +764,55 @@ ct_zones_reconfigure(struct datapath *dp, struct ovsrec_datapath *dp_cfg)
         struct ovsrec_ct_timeout_policy *tp_cfg = zone_cfg->timeout_policy;
 
         ct_zone = ct_zone_lookup(&dp->ct_zones, zone_id);
-        if (ct_zone) {
-            struct simap new_tp = SIMAP_INITIALIZER(&new_tp);
-            get_timeout_policy_from_ovsrec(&new_tp, tp_cfg);
-            if (update_timeout_policy(&ct_zone->tp, &new_tp)) {
-                ofproto_ct_set_zone_timeout_policy(dp->type, ct_zone->zone_id,
-                                                   &ct_zone->tp);
-            }
-        } else {
+        if (!ct_zone) {
             ct_zone = ct_zone_alloc(zone_id, tp_cfg);
             hmap_insert(&dp->ct_zones, &ct_zone->node, hash_int(zone_id, 0));
-            ofproto_ct_set_zone_timeout_policy(dp->type, ct_zone->zone_id,
-                                               &ct_zone->tp);
         }
+
+        struct simap new_tp = SIMAP_INITIALIZER(&new_tp);
+        get_timeout_policy_from_ovsrec(&new_tp, tp_cfg);
+
+        if (update_timeout_policy(&ct_zone->tp, &new_tp)) {
+            if (simap_count(&ct_zone->tp)) {
+                ofproto_ct_set_zone_timeout_policy(dp->type, ct_zone->zone_id,
+                                                   &ct_zone->tp);
+            } else {
+                ofproto_ct_del_zone_timeout_policy(dp->type, ct_zone->zone_id);
+            }
+        }
+
+        int64_t desired_limit = zone_cfg->limit ? *zone_cfg->limit : -1;
+        if (ct_zone->limit != desired_limit) {
+            ofproto_ct_zone_limit_update(dp->type, zone_id, zone_cfg->limit);
+            ct_zone->limit = desired_limit;
+        }
+
         ct_zone->last_used = idl_seqno;
+
+        protected = protected || !!zone_cfg->limit;
     }
 
     /* Purge 'ct_zone's no longer found in the database. */
     HMAP_FOR_EACH_SAFE (ct_zone, node, &dp->ct_zones) {
         if (ct_zone->last_used != idl_seqno) {
-            ofproto_ct_del_zone_timeout_policy(dp->type, ct_zone->zone_id);
             ct_zone_remove_and_destroy(dp, ct_zone);
         }
     }
+
+    /* Reconfigure default CT zone limit if needed. */
+    int64_t default_limit = dp_cfg->ct_zone_default_limit
+                            ? *dp_cfg->ct_zone_default_limit
+                            : -1;
+
+    if (dp->ct_zone_default_limit != default_limit) {
+        ofproto_ct_zone_limit_update(dp->type, OVS_ZONE_LIMIT_DEFAULT_ZONE,
+                                     dp_cfg->ct_zone_default_limit);
+        dp->ct_zone_default_limit = default_limit;
+    }
+
+    protected = protected || !!dp_cfg->ct_zone_default_limit;
+
+    ofproto_ct_zone_limit_protection_update(dp->type, protected);
 }
 
 static void
@@ -842,6 +889,10 @@ bridge_reconfigure(const struct ovsrec_open_vswitch *ovs_cfg)
     ofproto_set_threads(
         smap_get_int(&ovs_cfg->other_config, "n-handler-threads", 0),
         smap_get_int(&ovs_cfg->other_config, "n-revalidator-threads", 0));
+
+    ofproto_set_explicit_sampled_drops(
+        smap_get_bool(&ovs_cfg->other_config, "explicit-sampled-drops",
+                      OFPROTO_EXPLICIT_SAMPLED_DROPS_DEFAULT));
 
     /* Destroy "struct bridge"s, "struct port"s, and "struct iface"s according
      * to 'ovs_cfg', with only very minimal configuration otherwise.
@@ -943,6 +994,7 @@ bridge_reconfigure(const struct ovsrec_open_vswitch *ovs_cfg)
         bridge_configure_netflow(br);
         bridge_configure_sflow(br, &sflow_bridge_number);
         bridge_configure_ipfix(br);
+        bridge_configure_lsample(br);
         bridge_configure_spanning_tree(br);
         bridge_configure_tables(br);
         bridge_configure_dp_desc(br);
@@ -1491,10 +1543,11 @@ ovsrec_ipfix_is_valid(const struct ovsrec_ipfix *ipfix)
     return ipfix && ipfix->n_targets > 0;
 }
 
-/* Returns whether a Flow_Sample_Collector_Set row is valid. */
+/* Returns whether a Flow_Sample_Collector_Set row contains a valid IPFIX
+ * configuration. */
 static bool
-ovsrec_fscs_is_valid(const struct ovsrec_flow_sample_collector_set *fscs,
-                     const struct bridge *br)
+ovsrec_fscs_is_valid_ipfix(const struct ovsrec_flow_sample_collector_set *fscs,
+                           const struct bridge *br)
 {
     return ovsrec_ipfix_is_valid(fscs->ipfix) && fscs->bridge == br->cfg;
 }
@@ -1512,7 +1565,7 @@ bridge_configure_ipfix(struct bridge *br)
     const char *virtual_obs_id;
 
     OVSREC_FLOW_SAMPLE_COLLECTOR_SET_FOR_EACH(fe_cfg, idl) {
-        if (ovsrec_fscs_is_valid(fe_cfg, br)) {
+        if (ovsrec_fscs_is_valid_ipfix(fe_cfg, br)) {
             n_fe_opts++;
         }
     }
@@ -1575,7 +1628,7 @@ bridge_configure_ipfix(struct bridge *br)
         fe_opts = xcalloc(n_fe_opts, sizeof *fe_opts);
         opts = fe_opts;
         OVSREC_FLOW_SAMPLE_COLLECTOR_SET_FOR_EACH(fe_cfg, idl) {
-            if (ovsrec_fscs_is_valid(fe_cfg, br)) {
+            if (ovsrec_fscs_is_valid_ipfix(fe_cfg, br)) {
                 opts->collector_set_id = fe_cfg->id;
                 sset_init(&opts->targets);
                 sset_add_array(&opts->targets, fe_cfg->ipfix->targets,
@@ -1618,6 +1671,71 @@ bridge_configure_ipfix(struct bridge *br)
             opts++;
         }
         free(fe_opts);
+    }
+}
+
+/* Returns whether a Flow_Sample_Collector_Set row contains a valid local
+ * sampling configuration. */
+static bool
+ovsrec_fscs_is_valid_local(const struct ovsrec_flow_sample_collector_set *fscs,
+                           const struct bridge *br)
+{
+    return fscs->local_group_id && fscs->n_local_group_id == 1 &&
+           fscs->bridge == br->cfg;
+}
+
+/* Set local sample configuration on 'br'. */
+static void
+bridge_configure_lsample(struct bridge *br)
+{
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+    const struct ovsrec_flow_sample_collector_set *fscs;
+    struct ofproto_lsample_options *opts_array, *opts;
+    size_t n_opts = 0;
+    int ret;
+
+    /* Iterate the Flow_Sample_Collector_Set table twice.
+     * First to get the number of valid configuration entries, then to process
+     * each of them and build an array of options. */
+    OVSREC_FLOW_SAMPLE_COLLECTOR_SET_FOR_EACH (fscs, idl) {
+        if (ovsrec_fscs_is_valid_local(fscs, br)) {
+            n_opts++;
+        }
+    }
+
+    if (n_opts == 0) {
+        ofproto_set_local_sample(br->ofproto, NULL, 0);
+        return;
+    }
+
+    opts_array = xcalloc(n_opts, sizeof *opts_array);
+    opts = opts_array;
+
+    OVSREC_FLOW_SAMPLE_COLLECTOR_SET_FOR_EACH (fscs, idl) {
+        if (!ovsrec_fscs_is_valid_local(fscs, br)) {
+            continue;
+        }
+        opts->collector_set_id = fscs->id;
+        opts->group_id = *fscs->local_group_id;
+        opts++;
+    }
+
+    ret = ofproto_set_local_sample(br->ofproto, opts_array, n_opts);
+
+    if (ret == EOPNOTSUPP) {
+        if (n_opts) {
+            VLOG_WARN_RL(&rl,
+                         "bridge %s: ignoring local sampling configuration: "
+                         "not supported by this datapath",
+                         br->name);
+        }
+    } else if (ret) {
+        VLOG_ERR_RL(&rl, "bridge %s: error configuring local sampling: %s",
+                    br->name, ovs_strerror(ret));
+    }
+
+    if (n_opts > 0) {
+        free(opts_array);
     }
 }
 
@@ -3299,12 +3417,13 @@ bridge_run(void)
 
     bridge_run__();
 
-    /* Re-configure SSL.  We do this on every trip through the main loop,
+    /* Re-configure SSL/TLS.  We do this on every trip through the main loop,
      * instead of just when the database changes, because the contents of the
      * key and certificate files can change without the database changing.
      *
      * We do this before bridge_reconfigure() because that function might
-     * initiate SSL connections and thus requires SSL to be configured. */
+     * initiate SSL/TLS connections and thus requires SSL/TLS to be configured.
+     */
     if (cfg && cfg->ssl) {
         const struct ovsrec_ssl *ssl = cfg->ssl;
 
@@ -3352,7 +3471,7 @@ bridge_run(void)
 
             vlog_enable_async();
 
-            VLOG_INFO_ONCE("%s (Open vSwitch) %s", program_name, VERSION);
+            VLOG_INFO_ONCE("%s", ovs_get_program_version());
         }
     }
 
@@ -4003,6 +4122,8 @@ static void
 bridge_configure_tables(struct bridge *br)
 {
     static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+    char *prev_prefixes = NULL;
+    int prev_start = 0;
     int n_tables;
     int i, j;
 
@@ -4064,18 +4185,21 @@ bridge_configure_tables(struct bridge *br)
                 }
                 mf = mf_from_name(name);
                 if (!mf) {
-                    VLOG_WARN("bridge %s: 'prefixes' with unknown field: %s",
-                              br->name, name);
+                    VLOG_WARN_RL(&rl, "bridge %s: "
+                                 "'prefixes' with unknown field: %s",
+                                 br->name, name);
                     continue;
                 }
                 if (mf->flow_be32ofs < 0 || mf->n_bits % 32) {
-                    VLOG_WARN("bridge %s: 'prefixes' with incompatible field: "
-                              "%s", br->name, name);
+                    VLOG_WARN_RL(&rl, "bridge %s: "
+                                 "'prefixes' with incompatible field: %s",
+                                 br->name, name);
                     continue;
                 }
                 if (s.n_prefix_fields >= ARRAY_SIZE(s.prefix_fields)) {
-                    VLOG_WARN("bridge %s: 'prefixes' with too many fields, "
-                              "field not used: %s", br->name, name);
+                    VLOG_WARN_RL(&rl, "bridge %s: "
+                                 "'prefixes' with too many fields, "
+                                 "field not used: %s", br->name, name);
                     continue;
                 }
                 use_default_prefixes = false;
@@ -4087,8 +4211,10 @@ bridge_configure_tables(struct bridge *br)
             s.n_prefix_fields = ARRAY_SIZE(default_prefix_fields);
             memcpy(s.prefix_fields, default_prefix_fields,
                    sizeof default_prefix_fields);
-        } else {
+        }
+        if (VLOG_IS_DBG_ENABLED()) {
             struct ds ds = DS_EMPTY_INITIALIZER;
+
             for (int k = 0; k < s.n_prefix_fields; k++) {
                 if (k) {
                     ds_put_char(&ds, ',');
@@ -4098,14 +4224,27 @@ bridge_configure_tables(struct bridge *br)
             if (s.n_prefix_fields == 0) {
                 ds_put_cstr(&ds, "none");
             }
-            VLOG_INFO("bridge %s table %d: Prefix lookup with: %s.",
-                      br->name, i, ds_cstr(&ds));
+            if (!prev_prefixes) {
+                prev_prefixes = ds_steal_cstr(&ds);
+                prev_start = i;
+            } else if (prev_prefixes && strcmp(prev_prefixes, ds_cstr(&ds))) {
+                VLOG_DBG("bridge %s tables %d-%d: Prefix lookup with: %s.",
+                         br->name, prev_start, i - 1, prev_prefixes);
+                free(prev_prefixes);
+                prev_prefixes = ds_steal_cstr(&ds);
+                prev_start = i;
+            }
             ds_destroy(&ds);
         }
 
         ofproto_configure_table(br->ofproto, i, &s);
 
         free(s.groups);
+    }
+    if (prev_prefixes) {
+        VLOG_DBG("bridge %s tables %d-%d: Prefix lookup with: %s.",
+                 br->name, prev_start, n_tables - 1, prev_prefixes);
+        free(prev_prefixes);
     }
     for (; j < br->cfg->n_flow_tables; j++) {
         VLOG_WARN_RL(&rl, "bridge %s: ignoring configuration for flow table "
@@ -5098,6 +5237,7 @@ mirror_configure(struct mirror *m)
 {
     const struct ovsrec_mirror *cfg = m->cfg;
     struct ofproto_mirror_settings s;
+    int ret;
 
     /* Set name. */
     if (strcmp(cfg->name, m->name)) {
@@ -5166,8 +5306,18 @@ mirror_configure(struct mirror *m)
     /* Get VLAN selection. */
     s.src_vlans = vlan_bitmap_from_array(cfg->select_vlan, cfg->n_select_vlan);
 
+    /* Set the filter, mirror_set() will strdup this pointer. */
+    s.filter = cfg->filter;
+
     /* Configure. */
-    ofproto_mirror_register(m->bridge->ofproto, m, &s);
+    ret = ofproto_mirror_register(m->bridge->ofproto, m, &s);
+    if (ret == EOPNOTSUPP) {
+        VLOG_ERR("ofproto %s: does not support mirroring",
+                 m->bridge->ofproto->name);
+    } else if (ret) {
+        VLOG_ERR("bridge %s: mirror %s configuration is invalid",
+                 m->bridge->name, m->name);
+    }
 
     /* Clean up. */
     if (s.srcs != s.dsts) {

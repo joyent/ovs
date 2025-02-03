@@ -21,7 +21,7 @@ Build-Depends:
  iproute2,
  libcap-ng-dev,
  libdbus-1-dev [amd64 i386 ppc64el arm64],
-# DPDK_NETDEV  libdpdk-dev (>= 22.11) [amd64 i386 ppc64el arm64],
+# DPDK_NETDEV  libdpdk-dev (>= 24.11) [amd64 i386 ppc64el arm64],
  libnuma-dev [amd64 i386 ppc64el arm64],
  libpcap-dev [amd64 i386 ppc64el arm64],
  libssl-dev,
@@ -39,14 +39,17 @@ Rules-Requires-Root: no
 Homepage: http://openvswitch.org/
 Vcs-Browser: https://salsa.debian.org/openstack-team/third-party/openvswitch/-/tree/debian/experimental
 Vcs-Git: https://salsa.debian.org/openstack-team/third-party/openvswitch.git
+X-Python3-Version: >= 3.10
 
 Package: openvswitch-common
 Architecture: linux-any
 Depends:
  openssl,
  ${misc:Depends},
- ${python3:Depends},
  ${shlibs:Depends},
+Recommends:
+ python3-openvswitch (= ${binary:Version}),
+ ${python3:Depends},
 Suggests:
  ethtool,
  openvswitch-doc,
@@ -94,7 +97,6 @@ Depends:
  python3-openvswitch (= ${source:Version}),
  strongswan,
  ${misc:Depends},
- ${shlibs:Depends},
 Suggests: python3:any
 Breaks:
  openvswitch-common (<< 2.17~),
@@ -154,12 +156,13 @@ Depends:
  netbase,
  openvswitch-common (= ${binary:Version}),
  procps,
- python3-netifaces,
- python3-openvswitch (>= ${source:Version}),
  uuid-runtime,
  ${misc:Depends},
- ${python3:Depends},
  ${shlibs:Depends},
+Recommends:
+ python3-netifaces,
+ python3-openvswitch (>= ${source:Version}),
+ ${python3:Depends},
 Breaks:
  openvswitch-common (<< 2.17~),
 Replaces:
@@ -183,7 +186,6 @@ Description: Open vSwitch switch implementations
 # DPDK_NETDEV  dpdk,
 # DPDK_NETDEV  openvswitch-switch (= ${binary:Version}),
 # DPDK_NETDEV  ${misc:Depends},
-# DPDK_NETDEV  ${python3:Depends},
 # DPDK_NETDEV  ${shlibs:Depends},
 # DPDK_NETDEV Enhances:
 # DPDK_NETDEV  openvswitch-switch,
@@ -258,7 +260,6 @@ Depends:
  openvswitch-switch (>= ${binary:Version}),
  python3-openvswitch (>= ${source:Version}),
  ${misc:Depends},
- ${python3:Depends},
  ${shlibs:Depends},
 Suggests: python3:any
 Breaks:
@@ -284,9 +285,13 @@ Depends:
  ${misc:Depends},
  ${python3:Depends},
  ${shlibs:Depends},
-Suggests:
+Recommends:
+ python3-click,
  python3-netaddr,
  python3-pyparsing,
+ python3-rich,
+Suggests:
+ python3-graphviz,
  python3-unbound,
 Description: Python 3 bindings for Open vSwitch
  Open vSwitch is a production quality, multilayer, software-based,

@@ -1635,6 +1635,7 @@ void packet_set_ipv6_addr(struct dp_packet *packet, uint8_t proto,
                           bool recalculate_csum);
 void packet_set_ipv6_flow_label(ovs_16aligned_be32 *flow_label,
                                 ovs_be32 flow_key);
+void packet_set_ipv6_tc(ovs_16aligned_be32 *flow_label, uint8_t tc);
 void packet_set_tcp_port(struct dp_packet *, ovs_be16 src, ovs_be16 dst);
 void packet_set_udp_port(struct dp_packet *, ovs_be16 src, ovs_be16 dst);
 void packet_set_sctp_port(struct dp_packet *, ovs_be16 src, ovs_be16 dst);
@@ -1682,9 +1683,9 @@ uint32_t packet_csum_pseudoheader(const struct ip_header *);
 bool packet_rh_present(struct dp_packet *packet, uint8_t *nexthdr,
                        bool *first_frag);
 void IP_ECN_set_ce(struct dp_packet *pkt, bool is_ipv6);
-void packet_tcp_complete_csum(struct dp_packet *);
-void packet_udp_complete_csum(struct dp_packet *);
-void packet_sctp_complete_csum(struct dp_packet *);
+void packet_tcp_complete_csum(struct dp_packet *, bool is_inner);
+void packet_udp_complete_csum(struct dp_packet *, bool is_inner);
+void packet_sctp_complete_csum(struct dp_packet *, bool is_inner);
 
 #define DNS_HEADER_LEN 12
 struct dns_header {

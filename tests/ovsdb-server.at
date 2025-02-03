@@ -183,6 +183,31 @@ AT_CHECK(
 OVSDB_SERVER_SHUTDOWN
 AT_CLEANUP
 
+AT_SETUP([database multiplexing implementation with config file])
+AT_KEYWORDS([ovsdb server positive config-file])
+ordinal_schema > schema1
+constraint_schema > schema2
+AT_CHECK([ovsdb-tool create db1 schema1], [0], [ignore], [ignore])
+AT_CHECK([ovsdb-tool create db2 schema2], [0], [ignore], [ignore])
+on_exit 'kill $(cat *.pid)'
+
+AT_DATA([config.json], [
+{"remotes"  : { "punix:db.sock": {} },
+ "databases": { "db1": {}, "db2": { "service-model": "standalone" } } }
+])
+
+AT_CHECK([ovsdb-server --detach --no-chdir --log-file --pidfile \
+            --config-file=config.json], [0], [ignore], [ignore])
+CHECK_DBS([constraints
+ordinals
+])
+AT_CHECK(
+  [[ovstest test-jsonrpc request unix:db.sock get_schema [\"nonexistent\"]]], [0],
+  [[{"error":{"details":"get_schema request specifies unknown database nonexistent","error":"unknown database","syntax":"[\"nonexistent\"]"},"id":0,"result":null}
+]])
+OVSDB_SERVER_SHUTDOWN
+AT_CLEANUP
+
 AT_SETUP([ovsdb-server/add-db and remove-db])
 AT_KEYWORDS([ovsdb server positive])
 on_exit 'kill `cat *.pid`'
@@ -298,16 +323,162 @@ AT_CHECK([uuidfilt db-change-unaware.stdout], [0], [dnl
 OVSDB_SERVER_SHUTDOWN(["/no database named ordinals/d"])
 AT_CLEANUP
 
+AT_SETUP([ovsdb-server/add-db and remove-db with a config file])
+AT_KEYWORDS([ovsdb server positive config-file])
+on_exit 'kill $(cat *.pid)'
+ordinal_schema > schema1
+constraint_schema > schema2
+AT_CHECK([ovsdb-tool create db1 schema1], [0], [ignore], [ignore])
+AT_CHECK([ovsdb-tool create db2 schema2], [0], [ignore], [ignore])
+
+dnl Start ovsdb-server with just a single database - db1.
+AT_DATA([config.json], [
+{
+    "remotes": {
+        "punix:db.sock": {}
+    },
+    "databases": {
+        "db1": {}
+    }
+}
+])
+AT_CAPTURE_FILE([config.json])
+AT_CHECK([ovsdb-server -vfile -vvlog:off --log-file --detach --no-chdir \
+            --pidfile --config-file=config.json], [0], [ignore], [ignore])
+CHECK_DBS([ordinals
+])
+
+dnl Remove the database.
+AT_CHECK([sed -i'back' '/db1/d' config.json])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/reload])
+CHECK_DBS([])
+
+dnl Start monitoring processes.
+AT_CHECK([ovsdb-client --detach --no-chdir --pidfile=ovsdb-client-1.pid \
+            --no-db-change-aware --no-headings monitor _Server Database name \
+            > db-change-unaware.stdout 2> db-change-unaware.stderr])
+AT_CHECK([ovsdb-client --detach --no-chdir --pidfile=ovsdb-client-2.pid \
+            --db-change-aware --no-headings monitor _Server Database name \
+            > db-change-aware.stdout 2> db-change-aware.stderr])
+AT_CAPTURE_FILE([db-change-unaware.stdout])
+AT_CAPTURE_FILE([db-change-unaware.stderr])
+AT_CAPTURE_FILE([db-change-aware.stdout])
+AT_CAPTURE_FILE([db-change-aware.stderr])
+
+dnl Add the first database back.
+AT_CHECK([sed -i'back' '/"databases"/a\
+                    "db1": {}
+                    ' config.json])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/reload])
+CHECK_DBS([ordinals
+])
+
+dnl Add the second database.
+AT_CHECK([sed -i'back' '/"databases"/a\
+                    "db2": {},
+                    ' config.json])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/reload])
+CHECK_DBS([constraints
+ordinals
+])
+
+dnl The databases are responsive.
+AT_CHECK([ovsdb-client list-tables unix:db.sock constraints], [0], [ignore], [ignore])
+AT_CHECK([ovsdb-client list-tables unix:db.sock ordinals], [0], [ignore], [ignore])
+
+dnl Add an already added database.
+AT_CHECK([sed -i'back' '/"databases"/a\
+                    "db2": {},
+                    ' config.json])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/reload])
+
+dnl Fix the config back.
+AT_CHECK([sed -i'back' '/db2/d' config.json])
+AT_CHECK([sed -i'back' '/"databases"/a\
+                    "db2": {},
+                    ' config.json])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/reload])
+
+dnl Add a non-existing database.
+AT_CHECK([sed -i'back' '/"databases"/a\
+                    "db3": {},
+                    ' config.json])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/reload], [2], [ignore], [ignore])
+OVS_WAIT_UNTIL([grep -q 'failed to configure databases' ovsdb-server.log])
+AT_CHECK([sed -i'back' '/db3/d' config.json])
+
+dnl Add a remote through a db path in db1.
+AT_CHECK([sed -i'back' '/"remotes"/a\
+                    "db:ordinals,ordinals,name": {},
+                    ' config.json])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/reload])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/list-remotes],
+  [0], [db:ordinals,ordinals,name
+punix:db.sock
+])
+
+dnl Removing db1 has no effect on its remote.
+AT_CHECK([sed -i'back' '/db1/d' config.json])
+AT_CHECK([sed -i'back' 's/"db2": {},/"db2": {}/' config.json])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/reload], [2], [ignore], [ignore])
+CHECK_DBS([constraints
+])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/list-remotes],
+  [0], [db:ordinals,ordinals,name
+punix:db.sock
+])
+AT_CHECK([ovsdb-client list-tables unix:db.sock ordinals], [1], [ignore], [ignore])
+
+dnl Remove now missing remote.
+AT_CHECK([sed -i'back' '/db:ordinals,ordinals,name/d' config.json])
+
+dnl Remove db2.
+AT_CHECK([sed -i'back' '/db2/d' config.json])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/reload])
+CHECK_DBS()
+AT_CHECK([ovsdb-client list-tables unix:db.sock constraints], [1], [ignore], [ignore])
+
+dnl Add a removed database.
+AT_CHECK([sed -i'back' '/"databases"/a\
+                        "db2": {}
+                        ' config.json])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/reload])
+CHECK_DBS([constraints
+])
+AT_CHECK([ovsdb-client list-tables unix:db.sock constraints], [0], [ignore], [ignore])
+
+# Check the monitoring results.
+AT_CHECK([uuidfilt db-change-aware.stdout], [0], [dnl
+<0> initial _Server
+
+<1> insert ordinals
+
+<2> insert constraints
+
+<1> delete ordinals
+
+<2> delete constraints
+
+<3> insert constraints
+])
+AT_CHECK([uuidfilt db-change-unaware.stdout], [0], [dnl
+<0> initial _Server
+])
+
+OVSDB_SERVER_SHUTDOWN(["
+  /no database named ordinals/d
+  /failed to open database 'db3'/d
+  /failed to configure databases/d
+"])
+AT_CLEANUP
+
 AT_SETUP([ovsdb-server/add-db with --monitor])
 AT_KEYWORDS([ovsdb server positive])
 AT_SKIP_IF([test "$IS_WIN32" = "yes"])
 
-# This test intentionally causes SIGSEGV, so make Address Sanitizer ignore it.
+# This test intentionally causes SIGSEGV, so make sanitizers ignore it.
 ASAN_OPTIONS=$ASAN_OPTIONS:handle_segv=0; export ASAN_OPTIONS
-
-# Skip it if UB Sanitizer is being used.  There's no way to disable the
-# SEGV check at runtime.
-AT_SKIP_IF([test $TESTS_WITH_UBSAN = yes])
+UBSAN_OPTIONS=$UBSAN_OPTIONS:handle_segv=0; export UBSAN_OPTIONS
 
 # Start ovsdb-server, initially with one db.
 ordinal_schema > schema
@@ -344,12 +515,9 @@ AT_SETUP([ovsdb-server/add-db and remove-db with --monitor])
 AT_KEYWORDS([ovsdb server positive])
 AT_SKIP_IF([test "$IS_WIN32" = "yes"])
 
-# This test intentionally causes SIGSEGV, so make Address Sanitizer ignore it.
+# This test intentionally causes SIGSEGV, so make sanitizers ignore it.
 ASAN_OPTIONS=$ASAN_OPTIONS:handle_segv=0; export ASAN_OPTIONS
-
-# Skip it if UB Sanitizer is being used.  There's no way to disable the
-# SEGV check at runtime.
-AT_SKIP_IF([test $TESTS_WITH_UBSAN = yes])
+UBSAN_OPTIONS=$UBSAN_OPTIONS:handle_segv=0; export UBSAN_OPTIONS
 
 # Start ovsdb-server, initially with one db.
 ordinal_schema > schema
@@ -499,16 +667,88 @@ AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/list-remotes])
 OVSDB_SERVER_SHUTDOWN
 AT_CLEANUP
 
+AT_SETUP([ovsdb-server/add-remote and remove-remote with config file])
+AT_KEYWORDS([ovsdb server positive config-file])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore], [ignore])
+on_exit 'kill $(cat *.pid)'
+
+AT_DATA([config.json], [
+{
+    "remotes": {
+    },
+    "databases": { "db": {} }
+}
+])
+AT_CAPTURE_FILE([config.json])
+
+AT_CHECK([ovsdb-server -vfile --detach --no-chdir --log-file --pidfile \
+                       --config-file=config.json], [0], [ignore], [ignore])
+
+AT_CHECK([test ! -e socket1])
+AT_CHECK([sed -i'back' '/"remotes"/a\
+                    "punix:socket1": {}
+                    ' config.json])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/reload])
+if test "$IS_WIN32" = "yes"; then
+  OVS_WAIT_UNTIL([test -e socket1])
+else
+  OVS_WAIT_UNTIL([test -S socket1])
+fi
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/list-remotes],
+  [0], [punix:socket1
+])
+
+AT_CHECK([test ! -e socket2])
+AT_CHECK([sed -i'back' '/"remotes"/a\
+                    "punix:socket2": {},
+                    ' config.json])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/reload])
+if test "$IS_WIN32" = "yes"; then
+  OVS_WAIT_UNTIL([test -e socket2])
+else
+  OVS_WAIT_UNTIL([test -S socket2])
+fi
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/list-remotes],
+  [0], [punix:socket1
+punix:socket2
+])
+
+AT_CHECK([sed -i'back' '/"remotes"/a\
+                    "db:x,y,z": {},
+                    ' config.json])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/reload], [2], [ignore], [ignore])
+OVS_WAIT_UNTIL([grep -q '"db:x,y,z": no database named x' ovsdb-server.log])
+AT_CHECK([sed -i'back' '/db:x,y,z/d' config.json])
+
+AT_CHECK([sed -i'back' '/punix:socket1/d' config.json])
+AT_CHECK([sed -i'back' 's/"punix:socket2": {},/"punix:socket2": {}/' config.json])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/reload])
+OVS_WAIT_UNTIL([test ! -e socket1])
+if test "$IS_WIN32" = "yes"; then
+  AT_CHECK([test -e socket2])
+else
+  AT_CHECK([test -S socket2])
+fi
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/list-remotes],
+  [0], [punix:socket2
+])
+
+AT_CHECK([sed -i'back' '/punix:socket2/d' config.json])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/reload])
+OVS_WAIT_UNTIL([test ! -e socket2])
+AT_CHECK([test ! -e socket1])
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/list-remotes])
+OVSDB_SERVER_SHUTDOWN(['/"db:x,y,z": no database named x/d'])
+AT_CLEANUP
+
 AT_SETUP([ovsdb-server/add-remote with --monitor])
 AT_KEYWORDS([ovsdb server positive])
 AT_SKIP_IF([test "$IS_WIN32" = "yes"])
 
-# This test intentionally causes SIGSEGV, so make Address Sanitizer ignore it.
+# This test intentionally causes SIGSEGV, so make sanitizers ignore it.
 ASAN_OPTIONS=$ASAN_OPTIONS:handle_segv=0; export ASAN_OPTIONS
-
-# Skip it if UB Sanitizer is being used.  There's no way to disable the
-# SEGV check at runtime.
-AT_SKIP_IF([test $TESTS_WITH_UBSAN = yes])
+UBSAN_OPTIONS=$UBSAN_OPTIONS:handle_segv=0; export UBSAN_OPTIONS
 
 # Start ovsdb-server, initially with no remotes.
 ordinal_schema > schema
@@ -545,12 +785,9 @@ AT_SETUP([ovsdb-server/add-remote and remove-remote with --monitor])
 AT_KEYWORDS([ovsdb server positive])
 AT_SKIP_IF([test "$IS_WIN32" = "yes"])
 
-# This test intentionally causes SIGSEGV, so make Address Sanitizer ignore it.
+# This test intentionally causes SIGSEGV, so make sanitizers ignore it.
 ASAN_OPTIONS=$ASAN_OPTIONS:handle_segv=0; export ASAN_OPTIONS
-
-# Skip it if UB Sanitizer is being used.  There's no way to disable the
-# SEGV check at runtime.
-AT_SKIP_IF([test $TESTS_WITH_UBSAN = yes])
+UBSAN_OPTIONS=$UBSAN_OPTIONS:handle_segv=0; export UBSAN_OPTIONS
 
 # Start ovsdb-server, initially with no remotes.
 ordinal_schema > schema
@@ -587,8 +824,8 @@ OVSDB_SERVER_SHUTDOWN(["
 "])
 AT_CLEANUP
 
-AT_SETUP([SSL db: implementation])
-AT_KEYWORDS([ovsdb server positive ssl $5])
+AT_SETUP([SSL/TLS db: implementation])
+AT_KEYWORDS([ovsdb server positive ssl tls $5])
 AT_SKIP_IF([test "$HAVE_OPENSSL" = no])
 # For this test, we pass PKIDIR through a ovsdb-tool transact and
 # msys on Windows does not convert the path style automatically.
@@ -605,11 +842,14 @@ AT_DATA([schema],
            "certificate": {"type": "string"},
            "ca_cert": {"type": "string"},
            "ssl_protocols" : {"type": "string"},
-           "ssl_ciphers" : {"type" : "string"}}}}}
+           "ssl_ciphers" : {"type" : "string"},
+           "ssl_ciphersuites" : {"type": "string"}
+         }}}}
 ]])
 AT_CHECK([ovsdb-tool create db schema], [0], [stdout], [ignore])
 # The !ECDHE-ECDSA-AES256-GCM-SHA384 in the ssl_ciphers is so that
-# a cipher negotiation failure can be tested for later.
+# a cipher negotiation failure can be tested for later.  Same for
+# the TLS_CHACHA20_POLY1305_SHA256 ciphersuite.
 AT_CHECK(
   [[ovsdb-tool transact db \
      '["mydb",
@@ -618,8 +858,10 @@ AT_CHECK(
         "row": {"private_key": "'"$PKIDIR/testpki-privkey2.pem"'",
                 "certificate": "'"$PKIDIR/testpki-cert2.pem"'",
                 "ca_cert": "'"$PKIDIR/testpki-cacert.pem"'",
-                "ssl_protocols": "'"TLSv1.2,TLSv1.1"'",
-                "ssl_ciphers": "'"HIGH:!aNULL:!MD5:!ECDHE-ECDSA-AES256-GCM-SHA384"'"}}]']],
+                "ssl_protocols": "'"TLSv1.3,TLSv1.2"'",
+                "ssl_ciphers": "'"DEFAULT:@SECLEVEL=2:!ECDHE-ECDSA-AES256-GCM-SHA384"'",
+                "ssl_ciphersuites": "TLS_CHACHA20_POLY1305_SHA256"
+               }}]']],
   [0], [ignore], [ignore])
 on_exit 'kill `cat *.pid`'
 AT_CHECK(
@@ -629,68 +871,62 @@ AT_CHECK(
         --ca-cert=db:mydb,SSL,ca_cert \
         --ssl-protocols=db:mydb,SSL,ssl_protocols \
         --ssl-ciphers=db:mydb,SSL,ssl_ciphers \
+        --ssl-ciphersuites=db:mydb,SSL,ssl_ciphersuites \
         --remote=pssl:0:127.0.0.1 db],
   [0], [ignore], [ignore])
 PARSE_LISTENING_PORT([ovsdb-server.log], [SSL_PORT])
-AT_CHECK(
-  [[ovsdb-client \
-        --private-key=$PKIDIR/testpki-privkey.pem \
-        --certificate=$PKIDIR/testpki-cert.pem \
-        --ca-cert=$PKIDIR/testpki-cacert.pem \
-        --ssl-protocols=TLSv1.2,TLSv1.1 \
-        --ssl-ciphers=HIGH:!aNULL:!MD5 \
-        transact ssl:127.0.0.1:$SSL_PORT \
-        '["mydb",
-          {"op": "select",
-           "table": "SSL",
-           "where": [],
-           "columns": ["private_key"]}]']],
-  [0], [stdout], [ignore])
-cat stdout >> output
+
+# SSL_OVSDB_CLIENT(PROTOCOL, [CIPHERS], [CIPHERSUITES])
+m4_define([SSL_OVSDB_CLIENT], [dnl
+  ovsdb-client -vconsole:stream_ssl:dbg \
+    --private-key=$PKIDIR/testpki-privkey.pem \
+    --certificate=$PKIDIR/testpki-cert.pem \
+    --ca-cert=$PKIDIR/testpki-cacert.pem \
+    --ssl-protocols=[$1] \
+    m4_if([$2], [], [], [--ssl-ciphers=$2]) \
+    m4_if([$3], [], [], [--ssl-ciphersuites=$3]) \
+    transact ssl:127.0.0.1:$SSL_PORT \
+    '[[["mydb",
+      {"op": "select",
+       "table": "SSL",
+       "where": [],
+       "columns": ["private_key"]}]]]'])
+
+AT_CHECK(SSL_OVSDB_CLIENT([TLSv1.3,TLSv1.2]), [0], [stdout], [ignore])
 AT_CHECK_UNQUOTED(
-  [cat output], [0],
+  [cat stdout], [0],
   [[@<:@{"rows":@<:@{"private_key":"$PKIDIR/testpki-privkey2.pem"}@:>@}@:>@
 ]], [ignore])
-# Check that when the server has TLSv1.1+ and the client has
-# TLSv1 that the connection fails.
-AT_CHECK(
-  [[ovsdb-client \
-        --private-key=$PKIDIR/testpki-privkey.pem \
-        --certificate=$PKIDIR/testpki-cert.pem \
-        --ca-cert=$PKIDIR/testpki-cacert.pem \
-        --ssl-protocols=TLSv1 \
-        --ssl-ciphers=HIGH:!aNULL:!MD5 \
-        transact ssl:127.0.0.1:$SSL_PORT \
-        '["mydb",
-          {"op": "select",
-           "table": "SSL",
-           "where": [],
-           "columns": ["private_key"]}]']], 
-  [1], [stdout], 
-  [stderr])
+
+# Check that connection over TLSv1.2 works.
+AT_CHECK(SSL_OVSDB_CLIENT([TLSv1.2]), [0], [stdout], [ignore])
+AT_CHECK_UNQUOTED(
+  [cat stdout], [0],
+  [[@<:@{"rows":@<:@{"private_key":"$PKIDIR/testpki-privkey2.pem"}@:>@}@:>@
+]], [ignore])
+
+# Check that connection over TLSv1.3 works.
+AT_CHECK(SSL_OVSDB_CLIENT([TLSv1.3]), [0], [stdout], [ignore])
+AT_CHECK_UNQUOTED(
+  [cat stdout], [0],
+  [[@<:@{"rows":@<:@{"private_key":"$PKIDIR/testpki-privkey2.pem"}@:>@}@:>@
+]], [ignore])
+
+# Check that, when the server has TLSv1.2+ and the client has
+# TLSv1.1, connection fails.
+AT_CHECK(SSL_OVSDB_CLIENT([TLSv1.1]), [1], [stdout], [stderr])
 cat stderr > output
 AT_CHECK_UNQUOTED(
   [sed -n "/failed to connect/s/ (.*)//p" output], [0],
   [ovsdb-client: failed to connect to "ssl:127.0.0.1:$SSL_PORT"
 ], 
   [ignore])
-# Check that when ciphers are not compatible, that a negotiation
+AT_CHECK([grep -q 'TLSv1.1 protocol is deprecated' output])
+AT_CHECK([grep -q 'Enabled protocol range: TLSv1.1 - TLSv1.1' stderr])
+# Check that when ciphers are not compatible, a negotiation
 # failure occurs.
-AT_CHECK(
-  [[ovsdb-client \
-        --private-key=$PKIDIR/testpki-privkey.pem \
-        --certificate=$PKIDIR/testpki-cert.pem \
-        --ca-cert=$PKIDIR/testpki-cacert.pem \
-        --ssl-protocols=TLSv1.2,TLSv1.1 \
-        --ssl-ciphers=ECDHE-ECDSA-AES256-GCM-SHA384 \
-        transact ssl:127.0.0.1:$SSL_PORT \
-        '["mydb",
-          {"op": "select",
-           "table": "SSL",
-           "where": [],
-           "columns": ["private_key"]}]']], 
-  [1], [stdout], 
-  [stderr])
+AT_CHECK(SSL_OVSDB_CLIENT([TLSv1.2], [ECDHE-ECDSA-AES256-GCM-SHA384]),
+         [1], [stdout], [stderr])
 cat stderr > output
 AT_CHECK_UNQUOTED(
   [sed -n "/failed to connect/s/ (.*)//p" output], [0],
@@ -699,10 +935,42 @@ AT_CHECK_UNQUOTED(
   [ignore])
 # The error message for being unable to negotiate a shared ciphersuite
 # is 'sslv3 alert handshake failure'. This is not the clearest message.
+# In openssl 3.2.0 all the error messages were updated to replace 'sslv3'
+# with 'ssl/tls'.
 AT_CHECK_UNQUOTED(
-  [grep "sslv3 alert handshake failure" output], [0],
+  [grep -E "(sslv3|ssl/tls) alert handshake failure" output], [0],
   [stdout],
   [ignore])
+
+# Check that when ciphersuites are not compatible, a negotiation
+# failure occurs.
+AT_CHECK(SSL_OVSDB_CLIENT([TLSv1.3], [DEFAULT], [TLS_AES_256_GCM_SHA384]),
+         [1], [stdout], [stderr])
+cat stderr > output
+AT_CHECK_UNQUOTED(
+  [sed -n "/failed to connect/s/ (.*)//p" output], [0],
+  [ovsdb-client: failed to connect to "ssl:127.0.0.1:$SSL_PORT"
+], [ignore])
+AT_CHECK([grep -q -E "(sslv3|ssl/tls) alert handshake failure" output])
+
+# Checking parsing of different protocol ranges.
+AT_CHECK(SSL_OVSDB_CLIENT([TLSv1.1,TLSv1.3]), [0], [stdout], [stderr])
+AT_CHECK([grep -q 'Enabled protocol range: TLSv1.1 - TLSv1.3' stderr])
+AT_CHECK([grep -q \
+            'TLSv1.2 is not configured, but will be enabled anyway' stderr])
+AT_CHECK(SSL_OVSDB_CLIENT([TLSv1.1-TLSv1.3]), [0], [stdout], [stderr])
+AT_CHECK([grep -q 'Enabled protocol range: TLSv1.1 - TLSv1.3' stderr])
+AT_CHECK([grep -q 'will be enabled anyway' stderr], [1])
+AT_CHECK(SSL_OVSDB_CLIENT([TLSv1.3-TLSv1.1]), [0], [stdout], [stderr])
+AT_CHECK([grep -q 'Enabled protocol range: TLSv1.1 - TLSv1.3' stderr])
+AT_CHECK([grep -q 'will be enabled anyway' stderr], [1])
+AT_CHECK(SSL_OVSDB_CLIENT([TLSv1.3+]), [0], [stdout], [stderr])
+AT_CHECK([grep -q 'Enabled protocol range: TLSv1.3 or later' stderr])
+AT_CHECK(SSL_OVSDB_CLIENT([TLSv1.2-TLSv1.3,TLSv1.3+]), [0], [stdout], [stderr])
+AT_CHECK([grep -q 'SSL/TLS protocol not recognized' stderr])
+AT_CHECK(SSL_OVSDB_CLIENT([TLSv1.2+TLSv1.3]), [0], [stdout], [stderr])
+AT_CHECK([grep -q 'SSL/TLS protocol not recognized' stderr])
+
 OVSDB_SERVER_SHUTDOWN(["
   /stream_ssl|WARN/d
   /Protocol error/d
@@ -1181,6 +1449,7 @@ ovsdb_check_online_conversion cluster
 AT_CLEANUP
 
 AT_SETUP([ovsdb-server combines updates on backlogged connections])
+AT_KEYWORDS([ovsdb server])
 on_exit 'kill `cat *.pid`'
 
 # The maximum socket receive buffer size is important for this test, which
@@ -1279,6 +1548,7 @@ OVSDB_SERVER_SHUTDOWN
 AT_CLEANUP
 
 AT_SETUP([ovsdb-server transaction history size])
+AT_KEYWORDS([ovsdb server transaction])
 on_exit 'kill `cat *.pid`'
 
 dnl Start an ovsdb-server with the clustered vswitchd schema.
@@ -1361,7 +1631,7 @@ AT_CHECK([test $(get_memory_value atoms) -eq $db_atoms_before_conversion])
 OVSDB_SERVER_SHUTDOWN
 AT_CLEANUP
 
-AT_BANNER([OVSDB -- ovsdb-server transactions (SSL IPv4 sockets)])
+AT_BANNER([OVSDB -- ovsdb-server transactions (SSL/TLS IPv4 sockets)])
 
 # OVSDB_CHECK_EXECUTION(TITLE, SCHEMA, TRANSACTIONS, OUTPUT, [KEYWORDS])
 #
@@ -1379,7 +1649,7 @@ AT_BANNER([OVSDB -- ovsdb-server transactions (SSL IPv4 sockets)])
 # TITLE is provided to AT_SETUP and KEYWORDS to AT_KEYWORDS.
 m4_define([OVSDB_CHECK_EXECUTION], 
   [AT_SETUP([$1])
-   AT_KEYWORDS([ovsdb server positive ssl $5])
+   AT_KEYWORDS([ovsdb server positive ssl tls $5])
    AT_SKIP_IF([test "$HAVE_OPENSSL" = no])
    $2 > schema
    PKIDIR=$abs_top_builddir/tests
@@ -1397,7 +1667,7 @@ cat stdout >> output
 
 EXECUTION_EXAMPLES
 
-AT_BANNER([OVSDB -- ovsdb-server transactions (SSL IPv6 sockets)])
+AT_BANNER([OVSDB -- ovsdb-server transactions (SSL/TLS IPv6 sockets)])
 
 # OVSDB_CHECK_EXECUTION(TITLE, SCHEMA, TRANSACTIONS, OUTPUT, [KEYWORDS])
 #
@@ -1415,7 +1685,7 @@ AT_BANNER([OVSDB -- ovsdb-server transactions (SSL IPv6 sockets)])
 # TITLE is provided to AT_SETUP and KEYWORDS to AT_KEYWORDS.
 m4_define([OVSDB_CHECK_EXECUTION],
   [AT_SETUP([$1])
-   AT_KEYWORDS([ovsdb server positive ssl6 $5])
+   AT_KEYWORDS([ovsdb server positive ssl6 ssl tls $5])
    AT_SKIP_IF([test "$HAVE_OPENSSL" = no])
    AT_SKIP_IF([test $HAVE_IPV6 = no])
    $2 > schema
@@ -1593,12 +1863,30 @@ m4_define([OVSDB_CHECK_EXECUTION_RELAY],
             ], [0], [ignore], [ignore])
 
    for i in $(seq 2 ${n_servers}); do
-     AT_CHECK([ovsdb-server --detach --no-chdir                           dnl
-                            --log-file=ovsdb-server$i.log                 dnl
-                            --pidfile=${i}.pid --remote=punix:db${i}.sock dnl
-                            --unixctl=unixctl${i} -vjsonrpc:file:dbg      dnl
-                            relay:${schema_name}:unix:db$((i-1)).sock
-            ], [0], [ignore], [ignore])
+     dnl Run every second relay with a config file.
+     if test $(expr $i % 2) -eq 0; then
+       echo "{
+             \"remotes\": { \"punix:db${i}.sock\": {} },
+             \"databases\": {
+                 \"${schema_name}\": {
+                     \"service-model\": \"relay\",
+                     \"source\": { \"unix:db$((i-1)).sock\": {} }
+                 }
+             }
+       }" > config${i}.json
+       AT_CHECK([ovsdb-server --detach --no-chdir --pidfile=${i}.pid     \
+                           --log-file=ovsdb-server$i.log                 \
+                           --unixctl=unixctl${i} -vjsonrpc:file:dbg      \
+                           --config-file=config${i}.json
+                ], [0], [ignore], [ignore])
+     else
+       AT_CHECK([ovsdb-server --detach --no-chdir                        \
+                           --log-file=ovsdb-server$i.log                 \
+                           --pidfile=${i}.pid --remote=punix:db${i}.sock \
+                           --unixctl=unixctl${i} -vjsonrpc:file:dbg      \
+                           relay:${schema_name}:unix:db$((i-1)).sock
+                ], [0], [ignore], [ignore])
+     fi
    done
 
    m4_foreach([txn], [$4],
@@ -1645,13 +1933,14 @@ AT_BANNER([OVSDB -- ovsdb-server replication])
 
 # OVSDB_CHECK_EXECUTION(TITLE, SCHEMA, TRANSACTIONS, OUTPUT, [KEYWORDS])
 #
-# Creates two databases with the given SCHEMA, and starts an ovsdb-server on
+# Creates three databases with the given SCHEMA, and starts an ovsdb-server on
 # each database.
 # Runs each of the TRANSACTIONS (which should be a quoted list of
 # quoted strings) against one of the servers with ovsdb-client one at a
-# time. The server replicates its database to the other ovsdb-server.
+# time. The server replicates its database to the other two ovsdb-servers,
+# one of which is configured via command line and the other via --config-file.
 #
-# Checks that the dump of both databases are the same.
+# Checks that the dump of all databases are the same.
 #
 # TITLE is provided to AT_SETUP and KEYWORDS to AT_KEYWORDS.
 m4_define([OVSDB_CHECK_EXECUTION],
@@ -1660,22 +1949,43 @@ m4_define([OVSDB_CHECK_EXECUTION],
    $2 > schema
    AT_CHECK([ovsdb-tool create db1 schema], [0], [stdout], [ignore])
    AT_CHECK([ovsdb-tool create db2 schema], [0], [stdout], [ignore])
+   AT_CHECK([ovsdb-tool create db3 schema], [0], [stdout], [ignore])
 
-   on_exit 'kill `cat *.pid`'
-   AT_CHECK([ovsdb-server --detach --no-chdir --log-file=ovsdb-server1.log --pidfile --remote=punix:db.sock db1], [0], [ignore], [ignore])
-   i
+   on_exit 'kill $(cat *.pid)'
+   AT_CHECK([ovsdb-server -vfile --detach --no-chdir --log-file=ovsdb-server1.log \
+                --pidfile --remote=punix:db.sock db1], [0], [ignore], [ignore])
 
-   AT_CHECK([ovsdb-server --detach --no-chdir --log-file=ovsdb-server2.log --pidfile=2.pid --remote=punix:db2.sock --unixctl=unixctl2 --sync-from=unix:db.sock db2], [0], [ignore], [ignore])
+   AT_CHECK([ovsdb-server -vfile --detach --no-chdir --log-file=ovsdb-server2.log \
+                --pidfile=2.pid --remote=punix:db2.sock --unixctl=unixctl2 \
+                --sync-from=unix:db.sock db2], [0], [ignore], [ignore])
+
+   AT_DATA([config3.json], [
+     {
+       "remotes": { "punix:db3.sock": {} },
+       "databases": {
+         "db3": {
+           "service-model": "active-backup",
+           "backup": true,
+           "source": { "unix:db.sock": {} }
+         }
+       }
+     }
+])
+   AT_CHECK([ovsdb-server -vfile --detach --no-chdir --log-file=ovsdb-server3.log \
+                --pidfile=3.pid --unixctl=unixctl3 --config-file=config3.json],
+            [0], [ignore], [ignore])
 
    m4_foreach([txn], [$3],
      [AT_CHECK([ovsdb-client transact 'txn'], [0], [stdout], [ignore])
    ])
 
    AT_CHECK([ovsdb-client dump], [0], [stdout], [ignore])
-   OVS_WAIT_UNTIL([ ovsdb-client dump unix:db2.sock > dump2; diff stdout dump2])
+   OVS_WAIT_UNTIL([ ovsdb-client dump unix:db2.sock > dump2; diff -u stdout dump2])
+   OVS_WAIT_UNTIL([ ovsdb-client dump unix:db3.sock > dump3; diff -u stdout dump3])
 
    OVSDB_SERVER_SHUTDOWN
    OVSDB_SERVER_SHUTDOWN2
+   OVSDB_SERVER_SHUTDOWN_N([3])
    AT_CLEANUP])
 
 EXECUTION_EXAMPLES
@@ -1684,18 +1994,21 @@ AT_BANNER([OVSDB -- ovsdb-server replication table-exclusion])
 
 # OVSDB_CHECK_REPLICATION(TITLE, SCHEMA, TRANSACTIONS, OUTPUT, [KEYWORDS])
 #
-# Creates two databases with the given SCHEMA, and starts an
+# Creates three databases with the given SCHEMA, and starts an
 # ovsdb-server on each database.
 # Runs each of the TRANSACTIONS (which should be a quoted list of
 # quoted strings) against one of the servers with ovsdb-client one at a
-# time. The server replicates its database to the other ovsdb-server.
+# time. The server replicates its database to the other two ovsdb-servers,
+# one of which is configured via command line and the other via --config-file.
 #
-# Checks that the difference between the dump of the databases is
-# OUTPUT, but UUIDs in the output are replaced by markers of the form
-# <N> where N is a number.  The first unique UUID is replaced by <0>,
+# Checks that the difference between the dump of the first and the other two
+# databases is OUTPUT, but UUIDs in the output are replaced by markers of the
+# form <N> where N is a number.  The first unique UUID is replaced by <0>,
 # the next by <1>, and so on.
 # If a given UUID appears more than once it is always replaced by the
 # same marker.
+#
+# Also checks that the dumps of the second and third databases are the same.
 #
 # TITLE is provided to AT_SETUP and KEYWORDS to AT_KEYWORDS.
 m4_define([OVSDB_CHECK_REPLICATION],
@@ -1705,11 +2018,33 @@ m4_define([OVSDB_CHECK_REPLICATION],
    $2 > schema
    AT_CHECK([ovsdb-tool create db1 schema], [0], [stdout], [ignore])
    AT_CHECK([ovsdb-tool create db2 schema], [0], [stdout], [ignore])
+   AT_CHECK([ovsdb-tool create db3 schema], [0], [stdout], [ignore])
 
-   on_exit 'kill `cat *.pid`'
-   AT_CHECK([ovsdb-server --detach --no-chdir --log-file=ovsdb-server1.log --pidfile --remote=punix:db.sock db1], [0], [ignore], [ignore])
+   on_exit 'kill $(cat *.pid)'
+   AT_CHECK([ovsdb-server -vfile --detach --no-chdir --log-file=ovsdb-server1.log \
+                --pidfile --remote=punix:db.sock db1], [0], [ignore], [ignore])
 
-   AT_CHECK([ovsdb-server --detach --no-chdir --log-file=ovsdb-server2.log --pidfile=2.pid --remote=punix:db2.sock --unixctl=unixctl2 --sync-from=unix:db.sock --sync-exclude-tables=mydb:b db2], [0], [ignore], [ignore])
+   AT_CHECK([ovsdb-server -vfile --detach --no-chdir --log-file=ovsdb-server2.log \
+                --pidfile=2.pid --remote=punix:db2.sock --unixctl=unixctl2 \
+                --sync-from=unix:db.sock --sync-exclude-tables=mydb:b db2],
+            [0], [ignore], [ignore])
+
+   AT_DATA([config3.json], [
+     {
+       "remotes": { "punix:db3.sock": {} },
+       "databases": {
+         "db3": {
+           "service-model": "active-backup",
+           "backup": true,
+           "source": { "unix:db.sock": {} },
+           "exclude-tables": [["b"]]
+         }
+       }
+     }
+])
+   AT_CHECK([ovsdb-server -vfile --detach --no-chdir --log-file=ovsdb-server3.log \
+                --pidfile=3.pid --unixctl=unixctl3 --config-file=config3.json],
+            [0], [ignore], [ignore])
 
    m4_foreach([txn], [$3],
      [AT_CHECK([ ovsdb-client transact 'txn' ], [0], [stdout], [ignore])
@@ -1722,6 +2057,11 @@ m4_define([OVSDB_CHECK_REPLICATION],
    AT_CHECK([ovsdb-client dump unix:db2.sock], [0], [stdout], [ignore])
    cat stdout > dump2
 
+   OVS_WAIT_UNTIL([ ovsdb-client dump unix:db3.sock | grep one ])
+   AT_CHECK([ovsdb-client dump unix:db3.sock], [0], [stdout], [ignore])
+   cat stdout > dump3
+   AT_CHECK([diff -u dump2 dump3])
+
    AT_CHECK([diff dump1 dump2], [1], [stdout], [ignore])
    cat stdout > output
 
@@ -1729,6 +2069,7 @@ m4_define([OVSDB_CHECK_REPLICATION],
 
    OVSDB_SERVER_SHUTDOWN
    OVSDB_SERVER_SHUTDOWN2
+   OVSDB_SERVER_SHUTDOWN_N([3])
    AT_CLEANUP])
 
 REPLICATION_EXAMPLES
@@ -1830,9 +2171,14 @@ replication_schema > schema
 AT_CHECK([ovsdb-tool create db1 schema], [0], [stdout], [ignore])
 AT_CHECK([ovsdb-tool create db2 schema], [0], [stdout], [ignore])
 
-AT_CHECK([ovsdb-server --detach --no-chdir --log-file=ovsdb-server1.log --pidfile --remote=punix:db.sock db1], [0], [ignore], [ignore])
+AT_CHECK([ovsdb-server -vfile --detach --no-chdir \
+            --log-file=ovsdb-server1.log --pidfile --remote=punix:db.sock db1],
+         [0], [ignore], [ignore])
 
-AT_CHECK([ovsdb-server --detach --no-chdir --log-file=ovsdb-server2.log --pidfile=2.pid --remote=punix:db2.sock --unixctl=unixctl2 db2], [0], [ignore], [ignore])
+AT_CHECK([ovsdb-server -vfile --detach --no-chdir \
+            --log-file=ovsdb-server2.log --pidfile=2.pid \
+            --remote=punix:db2.sock --unixctl=unixctl2 db2],
+         [0], [ignore], [ignore])
 
 dnl Try to connect without specifying the active server.
 AT_CHECK([ovs-appctl -t "`pwd`"/unixctl2 ovsdb-server/connect-active-ovsdb-server], [0],
@@ -1983,7 +2329,9 @@ OVS_WAIT_UNTIL([ovs-appctl -t "`pwd`"/unixctl2 ovsdb-server/sync-status |grep re
 
 dnl Switch the 'db1' to active
 AT_CHECK([ovs-appctl -t "`pwd`"/unixctl ovsdb-server/disconnect-active-ovsdb-server])
-AT_CHECK([ovs-appctl -t "`pwd`"/unixctl ovsdb-server/sync-status], [0], [state: active
+AT_CHECK([ovs-appctl -t "`pwd`"/unixctl ovsdb-server/sync-status], [0], [dnl
+database: mydb
+state: active
 ])
 
 dnl Issue a transaction to 'db1'
@@ -2002,7 +2350,9 @@ AT_CHECK([ovs-appctl -t "`pwd`"/unixctl ovsdb-server/connect-active-ovsdb-server
 
 dnl Verify the change happend
 OVS_WAIT_UNTIL([ovs-appctl -t "`pwd`"/unixctl ovsdb-server/sync-status |grep replicating])
-AT_CHECK([ovs-appctl -t "`pwd`"/unixctl2 ovsdb-server/sync-status], [0], [state: active
+AT_CHECK([ovs-appctl -t "`pwd`"/unixctl2 ovsdb-server/sync-status], [0], [dnl
+database: mydb
+state: active
 ])
 
 dnl Issue an transaction to 'db2' which is now active.
@@ -2026,6 +2376,140 @@ AT_CHECK([diff dump1 dump2])
 
 dnl OVSDB_SERVER_SHUTDOWN
 dnl OVSDB_SERVER_SHUTDOWN2
+AT_CLEANUP
+
+AT_SETUP([ovsdb-server/active-backup-role-switching with config file])
+AT_KEYWORDS([ovsdb server replication active-backup-switching config-file])
+replication_schema > schema
+AT_CHECK([ovsdb-tool create db1 schema], [0], [stdout], [ignore])
+AT_CHECK([ovsdb-tool create db2 schema], [0], [stdout], [ignore])
+
+dnl Add some data to both DBs.
+AT_CHECK([ovsdb-tool transact db1 \
+'[["mydb",
+  {"op": "insert",
+   "table": "a",
+   "row": {"number": 9, "name": "nine"}}]]'], [0], [ignore], [ignore])
+
+AT_CHECK([ovsdb-tool transact db2 \
+'[["mydb",
+  {"op": "insert",
+   "table": "a",
+   "row": {"number": 9, "name": "nine"}}]]'], [0], [ignore], [ignore])
+
+dnl Start both 'db1' and 'db2' in backup mode. Let them backup from each
+dnl other. This is not a supported operation state, but to simulate a start
+dnl up condition where an HA manger can select which one to be an active
+dnl server soon after.
+on_exit 'kill $(cat *.pid)'
+
+AT_DATA([config1.json], [
+{
+    "remotes": { "punix:db.sock": {} },
+    "databases": {
+        "db1": {
+            "service-model": "active-backup",
+            "backup": true,
+            "source": { "unix:db2.sock": {} }
+        }
+    }
+}
+])
+
+AT_CHECK([ovsdb-server -vfile --detach --no-chdir --log-file=ovsdb-server1.log \
+            --pidfile=1.pid --unixctl=unixctl1 --config-file=config1.json],
+         [0], [ignore], [ignore])
+
+AT_DATA([config2.json], [
+{
+    "remotes": { "punix:db2.sock": {} },
+    "databases": {
+        "db2": {
+            "service-model": "active-backup",
+            "backup": true,
+            "source": { "unix:db.sock": {} }
+        }
+    }
+}
+])
+AT_CHECK([ovsdb-server -vfile --detach --no-chdir --log-file=ovsdb-server2.log \
+            --pidfile=2.pid --unixctl=unixctl2 --config-file=config2.json],
+         [0], [ignore], [ignore])
+
+dnl Make sure both servers reached the replication state.
+OVS_WAIT_UNTIL([ovs-appctl -t $(pwd)/unixctl1 ovsdb-server/sync-status | grep replicating])
+OVS_WAIT_UNTIL([ovs-appctl -t $(pwd)/unixctl2 ovsdb-server/sync-status | grep replicating])
+
+dnl Switch the 'db1' to active.
+AT_CHECK([sed -i'back' 's/"backup": true/"backup": false/' config1.json])
+AT_CHECK([ovs-appctl -t $(pwd)/unixctl1 ovsdb-server/reload])
+AT_CHECK([ovs-appctl -t $(pwd)/unixctl1 ovsdb-server/sync-status], [0], [dnl
+database: mydb
+state: active
+])
+
+dnl Issue a transaction to 'db1'.
+AT_CHECK([ovsdb-client transact unix:db.sock \
+'[["mydb",
+  {"op": "insert",
+   "table": "a",
+   "row": {"number": 0, "name": "zero"}}]]'], [0], [ignore])
+
+dnl It should be replicated to 'db2'.
+OVS_WAIT_UNTIL([ovsdb-client dump unix:db2.sock | grep zero])
+
+dnl Issue a transaction to 'db2', it should fail.
+AT_CHECK([ovsdb-client transact unix:db2.sock \
+'[["mydb",
+  {"op": "insert",
+   "table": "a",
+   "row": {"number": 1, "name": "one"}}]]'], [0], [dnl
+[[{"details":"insert operation not allowed when database server is in read only mode","error":"not allowed"}]]
+])
+
+dnl Flip the role of 'db1' and 'db2'.  'db1' becomes backup, and 'db2' becomes active.
+AT_CHECK([sed -i'back' 's/"backup": true/"backup": false/' config2.json])
+AT_CHECK([ovs-appctl -t $(pwd)/unixctl2 ovsdb-server/reload])
+AT_CHECK([sed -i'back' 's/"backup": false/"backup": true/' config1.json])
+AT_CHECK([ovs-appctl -t $(pwd)/unixctl1 ovsdb-server/reload])
+
+dnl Verify the change happend.
+OVS_WAIT_UNTIL([ovs-appctl -t $(pwd)/unixctl1 ovsdb-server/sync-status | grep replicating])
+AT_CHECK([ovs-appctl -t $(pwd)/unixctl2 ovsdb-server/sync-status], [0], [dnl
+database: mydb
+state: active
+])
+
+dnl Issue a transaction to 'db2' which is now active.
+AT_CHECK([ovsdb-client transact unix:db2.sock \
+'[["mydb",
+  {"op": "insert",
+   "table": "b",
+   "row": {"number": 1, "name": "one"}}]]'], [0], [ignore])
+
+dnl The transaction should be replicated to 'db1'.
+OVS_WAIT_UNTIL([ovsdb-client dump unix:db.sock | grep one])
+
+dnl Issue a transaction to 'db1', it should fail.
+AT_CHECK([ovsdb-client transact unix:db.sock \
+'[["mydb",
+  {"op": "insert",
+   "table": "a",
+   "row": {"number": 2, "name": "two"}}]]'], [0], [dnl
+[[{"details":"insert operation not allowed when database server is in read only mode","error":"not allowed"}]]
+])
+
+dnl Both servers should have the same content.
+AT_CHECK([ovsdb-client dump unix:db.sock], [0], [stdout])
+cat stdout > dump1
+
+AT_CHECK([ovsdb-client dump unix:db2.sock], [0], [stdout])
+cat stdout > dump2
+
+AT_CHECK([diff -u dump1 dump2])
+
+OVSDB_SERVER_SHUTDOWN_N([1])
+OVSDB_SERVER_SHUTDOWN2
 AT_CLEANUP
 
 #ovsdb-server prevent self replicating
@@ -2153,9 +2637,16 @@ AT_CHECK([ovsdb-tool transact db2 \
 
 dnl Start both 'db1' and 'db2'.
 on_exit 'kill `cat *.pid`'
-AT_CHECK([ovsdb-server --detach --no-chdir --log-file=ovsdb-server1.log --pidfile --remote=punix:db.sock --unixctl="`pwd`"/unixctl db1 --active ], [0], [ignore], [ignore])
+AT_CHECK([ovsdb-server -vfile --detach --no-chdir \
+            --log-file=ovsdb-server1.log --pidfile \
+            --remote=punix:db.sock \
+            --unixctl="$(pwd)"/unixctl db1 --active ],
+         [0], [ignore], [ignore])
 
-AT_CHECK([ovsdb-server --detach --no-chdir --log-file=ovsdb-server2.log --pidfile=2.pid --remote=punix:db2.sock --unixctl="`pwd`"/unixctl2 db2], [0], [ignore], [ignore])
+AT_CHECK([ovsdb-server -vfile --detach --no-chdir \
+            --log-file=ovsdb-server2.log --pidfile=2.pid \
+            --remote=punix:db2.sock --unixctl="$(pwd)"/unixctl2 db2],
+         [0], [ignore], [ignore])
 
 OVS_WAIT_UNTIL([ovs-appctl -t "`pwd`"/unixctl ovsdb-server/sync-status |grep active])
 OVS_WAIT_UNTIL([ovs-appctl -t "`pwd`"/unixctl2 ovsdb-server/sync-status |grep active])
@@ -2375,6 +2866,7 @@ m4_define([CLEAN_LOG_FILE],
   [sed 's/[[0-9\-]]*T[[0-9:\.]]*Z|[[0-9]]*\(|.*$\)/\1/g' $1 | dnl
    sed '/|poll_loop|/d' |   dnl
    sed '/|socket_util|/d' | dnl
+   sed '/|cooperative_multitasking|DBG|/d' | dnl
    sed 's/[[0-9]]*\.ctl/<cleared>\.ctl/g'> $2])
 
 CLEAN_LOG_FILE([1.log], [1.log.clear])
@@ -2382,6 +2874,276 @@ CLEAN_LOG_FILE([2.log], [2.log.clear])
 
 dnl Checking that databases and logs are equal.
 AT_CHECK([diff db.clear ./replay_dir/db.copy.clear])
-AT_CHECK([diff 1.log.clear 2.log.clear])
+AT_CHECK([diff -u 1.log.clear 2.log.clear])
 
 AT_CLEANUP
+
+AT_BANNER([OVSDB -- ovsdb-server configuration file])
+
+dnl TEST_CONFIG_FILE([NAME], [config], [EXIT_CODE], [FAILURE_STRINGS])
+dnl
+dnl Tries the config as a data for --config-file, checks the EXIT_CODE
+dnl of the ovsdb-server and checks the stderr for FAILURE_STRINGS.
+dnl NAME is added to the test name and keywords.
+m4_define([TEST_CONFIG_FILE],
+[
+  AT_SETUP([ovsdb-server config-file - $1])
+  AT_KEYWORDS([ovsdb server config-file $1])
+  on_exit 'kill $(cat *.pid)'
+  echo '$2' > config.json
+  AT_CAPTURE_FILE([config.json])
+  ordinal_schema > schema
+  constraint_schema > schema2
+  AT_CHECK([ovsdb-tool create db schema], [0], [ignore], [ignore])
+  AT_CHECK([ovsdb-tool create db2 schema], [0], [ignore], [ignore])
+  AT_CHECK([ovsdb-tool create-cluster db_cluster schema2 unix:s1.raft],
+           [0], [ignore], [ignore])
+  AT_CHECK([ovsdb-server -vfile -vPATTERN:console:'%p|%m' -vvlog:off \
+                --log-file --detach --no-chdir --pidfile \
+                --config-file=config.json], [$3], [ignore], [stderr])
+  m4_if([$4], [], [], [
+    AT_CHECK([cat stderr | grep -v -E 'INFO|DBG' \
+        | grep -v 'failed to load configuration from' \
+        | sed -e "/duplicate database name/ s/'db'/'db2'/" \
+        > warnings])
+    AT_CHECK([cat warnings], [0], [m4_if([$3], [0], [$4], [$4
+ovsdb-server: server configuration failed
+])])])
+  m4_if([$3$4], [0], [OVSDB_SERVER_SHUTDOWN])
+  AT_CLEANUP
+])
+
+TEST_CONFIG_FILE([simple], [
+{
+    "remotes": { "punix:db.sock": {} },
+    "databases": { "db": null, "db_cluster": {} }
+}
+], [0])
+
+TEST_CONFIG_FILE([standalone], [
+{
+    "remotes": { "punix:db.sock": {} },
+    "databases": { "db": { "service-model": "standalone" } }
+}
+], [0])
+
+TEST_CONFIG_FILE([clustered], [
+{
+    "remotes": { "punix:db.sock": {} },
+    "databases": { "db_cluster": { "service-model": "clustered" } }
+}
+], [0])
+
+TEST_CONFIG_FILE([unknown service model], [
+{
+    "remotes": { "punix:db.sock": {} },
+    "databases": { "db": { "service-model": "not-a-service-model" } }
+}
+], [1], [dnl
+WARN|Unrecognized database service model: 'not-a-service-model'
+WARN|syntax "{"service-model":"not-a-service-model"}": syntax error:dnl
+ Parsing database db failed: 'not-a-service-model' is not a valid service model
+WARN|config: failed to parse 'databases'])
+
+TEST_CONFIG_FILE([same schema], [
+{
+    "remotes": { "punix:db.sock": {} },
+    "databases": { "db": null, "db2": {} }
+}
+], [1], [dnl
+WARN|failed to open database 'db2': ovsdb error: ordinals: duplicate database name
+WARN|failed to configure databases])
+
+TEST_CONFIG_FILE([model mismatch], [
+{
+    "remotes": { "punix:db.sock": {} },
+    "databases": { "db": { "service-model": "clustered" } }
+}
+], [1], [dnl
+WARN|failed to open database 'db': ovsdb error: db: database is standalone and not clustered
+WARN|failed to configure databases])
+
+TEST_CONFIG_FILE([model mismatch clustered], [
+{
+    "remotes": { "punix:db.sock": {} },
+    "databases": { "db_cluster": { "service-model": "standalone" } }
+}
+], [1], [dnl
+WARN|failed to open database 'db_cluster': ovsdb error: db_cluster: database is clustered and not standalone
+WARN|failed to configure databases])
+
+TEST_CONFIG_FILE([relay], [
+{
+    "remotes": { "punix:db.sock": {} },
+    "databases": {
+        "RelaySchema": {
+            "service-model": "relay",
+            "source": { "unix:db2.sock": {} }
+        }
+    }
+}
+], [0])
+
+TEST_CONFIG_FILE([relay without source], [
+{
+    "remotes": { "punix:db.sock": {} },
+    "databases": {
+        "RelaySchema": {
+            "service-model": "relay"
+        }
+    }
+}
+], [1], [dnl
+WARN|syntax "{"service-model":"relay"}": syntax error: Parsing database RelaySchema failed:dnl
+ Required 'source' member is missing.
+WARN|config: failed to parse 'databases'])
+
+TEST_CONFIG_FILE([relay with options], [
+{
+    "remotes": { "punix:db.sock": {} },
+    "databases": {
+        "RelaySchema": {
+            "service-model": "relay",
+            "source": {
+                "punix:db2.sock": {
+                    "inactivity-probe": 10000,
+                    "max-backoff": 8000,
+                    "dscp": 42
+                }
+            }
+        }
+    }
+}
+], [0])
+
+TEST_CONFIG_FILE([relay with unrelated options], [
+{
+    "remotes": { "punix:db.sock": {} },
+    "databases": {
+        "RelaySchema": {
+            "service-model": "relay",
+            "source": {
+                "punix:db2.sock": {
+                    "inactivity-probe": 10000,
+                    "max-backoff": 8000,
+                    "dscp": 42,
+                    "role": "My-RBAC-role"
+                }
+            }
+        }
+    }
+}
+], [0], [dnl
+WARN|syntax "{"dscp":42,"inactivity-probe":10000,"max-backoff":8000,"role":"My-RBAC-role"}":dnl
+ syntax error: Parsing JSON-RPC options failed: Member 'role' is present but not allowed here.
+])
+
+TEST_CONFIG_FILE([unknown config], [
+{
+    "remotes": { "punix:db.sock": {} },
+    "databases": {
+        "db": { "unknnown": "unknown" }
+    }
+}
+], [1], [dnl
+WARN|syntax "{"unknnown":"unknown"}": syntax error: Parsing database db failed:dnl
+ Member 'unknnown' is present but not allowed here.
+WARN|config: failed to parse 'databases'])
+
+TEST_CONFIG_FILE([active-backup active], [
+{
+    "remotes": { "punix:db.sock": {} },
+    "databases": {
+        "db": {
+            "service-model": "active-backup",
+            "backup": false
+        }
+    }
+}
+], [0])
+
+TEST_CONFIG_FILE([active-backup backup], [
+{
+    "remotes": { "punix:db.sock": {} },
+    "databases": {
+        "db": {
+            "service-model": "active-backup",
+            "backup": true,
+            "source": {
+                "punix:db2.sock": {
+                    "inactivity-probe": 100000,
+                    "max-backoff": 16000,
+                    "dscp": 42
+                }
+            }
+        }
+    }
+}
+], [0])
+
+TEST_CONFIG_FILE([active-backup backup without source], [
+{
+    "remotes": { "punix:db.sock": {} },
+    "databases": {
+        "db": {
+            "service-model": "active-backup",
+            "backup": true
+        }
+    }
+}
+], [1], [dnl
+WARN|syntax "{"backup":true,"service-model":"active-backup"}": syntax error:dnl
+ Parsing database db failed: Required 'source' member is missing.
+WARN|config: failed to parse 'databases'])
+
+TEST_CONFIG_FILE([syntax error], [
+{
+    "remotes": { "punix:db.sock": {}, },
+    "databases": { "db": {}, "db_cluster": {} }
+}
+], [1], [dnl
+WARN|config: reading JSON failed (line 2, column 38, byte 41: syntax error parsing object expecting string)])
+
+TEST_CONFIG_FILE([complex config], [
+{
+    "remotes": {
+        "punix:db.sock": {
+            "inactivity-probe": 0,
+            "read-only": false
+        },
+        "pssl:0:127.0.0.1": {
+            "inactivity-probe": 5000,
+            "max-backoff": 8000,
+            "read-only": true,
+            "role": "ovn-controller",
+            "dscp": 48
+        },
+        "db:ordinals,ordinals,name": null
+    },
+    "databases": {
+        "db_cluster": {
+            "service-model": "clustered"
+        },
+        "OVN_Northbound": {
+            "service-model": "relay",
+            "source": {
+                "unix:nb.sock": {
+                    "max-backoff": 3000,
+                    "inactivity-probe": 16000
+                }
+            }
+        },
+        "db": {
+            "service-model": "active-backup",
+            "backup": true,
+            "source": {
+                "unix:active.sock": {
+                    "max-backoff": 16000,
+                    "inactivity-probe": 180000
+                }
+            },
+            "exclude-tables": [["IC_SB_Global", "Availability_Zone"]]
+        }
+    }
+}
+], [0])

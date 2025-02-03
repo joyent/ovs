@@ -57,6 +57,30 @@ mcast_snooping_flood_unreg(const struct mcast_snooping *ms)
     return ms->flood_unreg;
 }
 
+char *
+mcast_snooping_group_protocol_str(enum mcast_group_proto grp_proto)
+{
+    switch (grp_proto) {
+    case MCAST_GROUP_IGMPV1:
+        return "IGMPv1";
+        break;
+    case MCAST_GROUP_IGMPV2:
+        return "IGMPv2";
+        break;
+    case MCAST_GROUP_IGMPV3:
+        return "IGMPv3";
+        break;
+    case MCAST_GROUP_MLDV1:
+        return "MLDv1";
+        break;
+    case MCAST_GROUP_MLDV2:
+        return "MLDv2";
+        break;
+    default:
+        return "UNKNOWN";
+    }
+}
+
 bool
 mcast_snooping_is_query(ovs_be16 igmp_type)
 {
@@ -389,7 +413,8 @@ mcast_snooping_prune_expired(struct mcast_snooping *ms,
 bool
 mcast_snooping_add_group(struct mcast_snooping *ms,
                          const struct in6_addr *addr,
-                         uint16_t vlan, void *port)
+                         uint16_t vlan, void *port,
+                         enum mcast_group_proto grp_proto)
     OVS_REQ_WRLOCK(ms->rwlock)
 {
     bool learned;
@@ -407,7 +432,9 @@ mcast_snooping_add_group(struct mcast_snooping *ms,
         uint32_t hash = mcast_table_hash(ms, addr, vlan);
 
         if (hmap_count(&ms->table) >= ms->max_entries) {
-            group_get_lru(ms, &grp);
+            if (!group_get_lru(ms, &grp)) {
+                return false;
+            }
             mcast_snooping_flush_group(ms, grp);
         }
 
@@ -424,6 +451,9 @@ mcast_snooping_add_group(struct mcast_snooping *ms,
     }
     mcast_group_insert_bundle(ms, grp, port, ms->idle_time);
 
+    /* update the protocol version. */
+    grp->protocol_version = grp_proto;
+
     /* Mark 'grp' as recently used. */
     ovs_list_push_back(&ms->group_lru, &grp->group_node);
     return learned;
@@ -431,11 +461,12 @@ mcast_snooping_add_group(struct mcast_snooping *ms,
 
 bool
 mcast_snooping_add_group4(struct mcast_snooping *ms, ovs_be32 ip4,
-                         uint16_t vlan, void *port)
+                         uint16_t vlan, void *port,
+                         enum mcast_group_proto grp_proto)
     OVS_REQ_WRLOCK(ms->rwlock)
 {
     struct in6_addr addr = in6_addr_mapped_ipv4(ip4);
-    return mcast_snooping_add_group(ms, &addr, vlan, port);
+    return mcast_snooping_add_group(ms, &addr, vlan, port, grp_proto);
 }
 
 int
@@ -478,7 +509,8 @@ mcast_snooping_add_report(struct mcast_snooping *ms,
                 || record->type == IGMPV3_CHANGE_TO_INCLUDE_MODE)) {
             ret = mcast_snooping_leave_group4(ms, ip4, vlan, port);
         } else {
-            ret = mcast_snooping_add_group4(ms, ip4, vlan, port);
+            ret = mcast_snooping_add_group4(ms, ip4, vlan, port,
+                                            MCAST_GROUP_IGMPV3);
         }
         if (ret) {
             count++;
@@ -513,7 +545,8 @@ mcast_snooping_add_mld(struct mcast_snooping *ms,
 
     switch (mld->type) {
     case MLD_REPORT:
-        ret = mcast_snooping_add_group(ms, addr, vlan, port);
+        ret = mcast_snooping_add_group(ms, addr, vlan, port,
+                                       MCAST_GROUP_MLDV1);
         if (ret) {
             count++;
         }
@@ -545,7 +578,8 @@ mcast_snooping_add_mld(struct mcast_snooping *ms,
                         || record->type == IGMPV3_CHANGE_TO_INCLUDE_MODE)) {
                     ret = mcast_snooping_leave_group(ms, addr, vlan, port);
                 } else {
-                    ret = mcast_snooping_add_group(ms, addr, vlan, port);
+                    ret = mcast_snooping_add_group(ms, addr, vlan, port,
+                                                   MCAST_GROUP_MLDV2);
                 }
                 if (ret) {
                     count++;
@@ -619,7 +653,7 @@ mrouter_get_lru(const struct mcast_snooping *ms,
     OVS_REQ_RDLOCK(ms->rwlock)
 {
     if (!ovs_list_is_empty(&ms->mrouter_lru)) {
-        *m = mcast_mrouter_from_lru_node(ms->mrouter_lru.next);
+        *m = mcast_mrouter_from_lru_node(ovs_list_front(&ms->mrouter_lru));
         return true;
     } else {
         *m = NULL;
@@ -692,7 +726,7 @@ mcast_snooping_port_get(const struct ovs_list *list,
                         struct mcast_port_bundle **f)
 {
     if (!ovs_list_is_empty(list)) {
-        *f = mcast_port_from_list_node(list->next);
+        *f = mcast_port_from_list_node(ovs_list_front(list));
         return true;
     } else {
         *f = NULL;
@@ -946,8 +980,9 @@ mcast_snooping_wait(struct mcast_snooping *ms)
 void
 mcast_snooping_flush_bundle(struct mcast_snooping *ms, void *port)
 {
-    struct mcast_group *g;
     struct mcast_mrouter_bundle *m;
+    struct mcast_port_bundle *p;
+    struct mcast_group *g;
 
     if (!mcast_snooping_enabled(ms)) {
         return;
@@ -967,6 +1002,20 @@ mcast_snooping_flush_bundle(struct mcast_snooping *ms, void *port)
     LIST_FOR_EACH_SAFE (m, mrouter_node, &ms->mrouter_lru) {
         if (m->port == port) {
             mcast_snooping_flush_mrouter(m);
+            ms->need_revalidate = true;
+        }
+    }
+
+    LIST_FOR_EACH_SAFE (p, node, &ms->fport_list) {
+        if (p->port == port) {
+            mcast_snooping_flush_port(p);
+            ms->need_revalidate = true;
+        }
+    }
+
+    LIST_FOR_EACH_SAFE (p, node, &ms->rport_list) {
+        if (p->port == port) {
+            mcast_snooping_flush_port(p);
             ms->need_revalidate = true;
         }
     }

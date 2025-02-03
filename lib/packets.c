@@ -224,7 +224,6 @@ compose_rarp(struct dp_packet *b, const struct eth_addr eth_src)
     arp->ar_tha = eth_src;
     put_16aligned_be32(&arp->ar_tpa, htonl(0));
 
-    dp_packet_reset_offsets(b);
     dp_packet_set_l3(b, arp);
     b->packet_type = htonl(PT_ETH);
 }
@@ -427,7 +426,7 @@ add_mpls(struct dp_packet *packet, ovs_be16 ethtype, ovs_be32 lse,
     }
 
     if (!l3_encap) {
-        struct mpls_hdr *header = dp_packet_push_uninit(packet, MPLS_HLEN);
+        struct mpls_hdr *header = dp_packet_resize_l2(packet, MPLS_HLEN);
 
         put_16aligned_be32(&header->mpls_lse, lse);
         packet->l2_5_ofs = 0;
@@ -513,7 +512,7 @@ push_nsh(struct dp_packet *packet, const struct nsh_hdr *nsh_hdr_src)
             OVS_NOT_REACHED();
     }
 
-    nsh = (struct nsh_hdr *) dp_packet_push_uninit(packet, length);
+    nsh = (struct nsh_hdr *) dp_packet_resize_l2(packet, length);
     memcpy(nsh, nsh_hdr_src, length);
     nsh->next_proto = next_proto;
     packet->packet_type = htonl(PT_NSH);
@@ -1114,7 +1113,6 @@ eth_compose(struct dp_packet *b, const struct eth_addr eth_dst,
     eth->eth_type = htons(eth_type);
 
     b->packet_type = htonl(PT_ETH);
-    dp_packet_reset_offsets(b);
     dp_packet_set_l3(b, data);
 
     return data;
@@ -1151,7 +1149,7 @@ packet_set_ipv4_addr(struct dp_packet *packet,
         }
     }
 
-    if (dp_packet_hwol_tx_ip_csum(packet)) {
+    if (dp_packet_hwol_l3_ipv4(packet)) {
         dp_packet_ol_reset_ip_csum_good(packet);
     } else {
         nh->ip_csum = recalc_csum32(nh->ip_csum, old_addr, new_addr);
@@ -1301,7 +1299,7 @@ packet_set_ipv6_flow_label(ovs_16aligned_be32 *flow_label, ovs_be32 flow_key)
     put_16aligned_be32(flow_label, new_label);
 }
 
-static void
+void
 packet_set_ipv6_tc(ovs_16aligned_be32 *flow_label, uint8_t tc)
 {
     ovs_be32 old_label = get_16aligned_be32(flow_label);
@@ -1330,7 +1328,7 @@ packet_set_ipv4(struct dp_packet *packet, ovs_be32 src, ovs_be32 dst,
     if (nh->ip_tos != tos) {
         uint8_t *field = &nh->ip_tos;
 
-        if (dp_packet_hwol_tx_ip_csum(packet)) {
+        if (dp_packet_hwol_l3_ipv4(packet)) {
             dp_packet_ol_reset_ip_csum_good(packet);
         } else {
             nh->ip_csum = recalc_csum16(nh->ip_csum, htons((uint16_t) *field),
@@ -1343,7 +1341,7 @@ packet_set_ipv4(struct dp_packet *packet, ovs_be32 src, ovs_be32 dst,
     if (nh->ip_ttl != ttl) {
         uint8_t *field = &nh->ip_ttl;
 
-        if (dp_packet_hwol_tx_ip_csum(packet)) {
+        if (dp_packet_hwol_l3_ipv4(packet)) {
             dp_packet_ol_reset_ip_csum_good(packet);
         } else {
             nh->ip_csum = recalc_csum16(nh->ip_csum, htons(*field << 8),
@@ -1747,7 +1745,6 @@ compose_arp__(struct dp_packet *b)
     arp->ar_hln = sizeof arp->ar_sha;
     arp->ar_pln = sizeof arp->ar_spa;
 
-    dp_packet_reset_offsets(b);
     dp_packet_set_l3(b, arp);
 
     b->packet_type = htonl(PT_ETH);
@@ -1982,7 +1979,7 @@ IP_ECN_set_ce(struct dp_packet *pkt, bool is_ipv6)
 
         tos |= IP_ECN_CE;
         if (nh->ip_tos != tos) {
-            if (dp_packet_hwol_tx_ip_csum(pkt)) {
+            if (dp_packet_hwol_l3_ipv4(pkt)) {
                 dp_packet_ol_reset_ip_csum_good(pkt);
             } else {
                 nh->ip_csum = recalc_csum16(nh->ip_csum, htons(nh->ip_tos),
@@ -1997,51 +1994,103 @@ IP_ECN_set_ce(struct dp_packet *pkt, bool is_ipv6)
 /* Set TCP checksum field in packet 'p' with complete checksum.
  * The packet must have the L3 and L4 offsets. */
 void
-packet_tcp_complete_csum(struct dp_packet *p)
+packet_tcp_complete_csum(struct dp_packet *p, bool inner)
 {
-    struct tcp_header *tcp = dp_packet_l4(p);
+    struct tcp_header *tcp;
+    size_t tcp_sz;
+    void *ip_hdr;
+    bool is_v4;
 
-    tcp->tcp_csum = 0;
-    if (dp_packet_hwol_is_ipv4(p)) {
-        struct ip_header *ip = dp_packet_l3(p);
+    if (inner) {
+        tcp = dp_packet_inner_l4(p);
+        ip_hdr = dp_packet_inner_l3(p);
+        tcp_sz = dp_packet_inner_l4_size(p);
+    } else {
+        tcp = dp_packet_l4(p);
+        ip_hdr = dp_packet_l3(p);
+        tcp_sz = dp_packet_l4_size(p);
+    }
 
-        tcp->tcp_csum = csum_finish(csum_continue(packet_csum_pseudoheader(ip),
-                                                  tcp, dp_packet_l4_size(p)));
+    ovs_assert(tcp);
+    ovs_assert(ip_hdr);
+
+    if (!inner && dp_packet_hwol_is_outer_ipv6(p)) {
+        is_v4 = false;
+    } else if (!inner && dp_packet_hwol_is_outer_ipv4(p)) {
+        is_v4 = true;
+    } else if (dp_packet_hwol_is_ipv4(p)) {
+        is_v4 = true;
     } else if (dp_packet_hwol_tx_ipv6(p)) {
-        struct ovs_16aligned_ip6_hdr *ip6 = dp_packet_l3(p);
-
-        tcp->tcp_csum = packet_csum_upperlayer6(ip6, tcp, ip6->ip6_nxt,
-                                                dp_packet_l4_size(p));
+        is_v4 = false;
     } else {
         OVS_NOT_REACHED();
+    }
+
+    tcp->tcp_csum = 0;
+    if (is_v4) {
+        struct ip_header *ip = ip_hdr;
+
+        tcp->tcp_csum = csum_finish(csum_continue(packet_csum_pseudoheader(ip),
+                                                  tcp, tcp_sz));
+    } else {
+        struct ovs_16aligned_ip6_hdr *ip6 = ip_hdr;
+
+        tcp->tcp_csum = packet_csum_upperlayer6(ip6, tcp, ip6->ip6_nxt,
+                                                tcp_sz);
     }
 }
 
 /* Set UDP checksum field in packet 'p' with complete checksum.
  * The packet must have the L3 and L4 offsets. */
 void
-packet_udp_complete_csum(struct dp_packet *p)
+packet_udp_complete_csum(struct dp_packet *p, bool inner)
 {
-    struct udp_header *udp = dp_packet_l4(p);
+    struct udp_header *udp;
+    size_t udp_sz;
+    void *ip_hdr;
+    bool is_v4;
+
+    if (inner) {
+        udp = dp_packet_inner_l4(p);
+        ip_hdr = dp_packet_inner_l3(p);
+        udp_sz = dp_packet_inner_l4_size(p);
+    } else {
+        udp = dp_packet_l4(p);
+        ip_hdr = dp_packet_l3(p);
+        udp_sz = dp_packet_l4_size(p);
+    }
+
+    ovs_assert(udp);
+    ovs_assert(ip_hdr);
 
     /* Skip csum calculation if the udp_csum is zero. */
     if (!udp->udp_csum) {
         return;
     }
 
-    udp->udp_csum = 0;
-    if (dp_packet_hwol_is_ipv4(p)) {
-        struct ip_header *ip = dp_packet_l3(p);
-
-        udp->udp_csum = csum_finish(csum_continue(packet_csum_pseudoheader(ip),
-                                                  udp, dp_packet_l4_size(p)));
+    if (!inner && dp_packet_hwol_is_outer_ipv6(p)) {
+        is_v4 = false;
+    } else if (!inner && dp_packet_hwol_is_outer_ipv4(p)) {
+        is_v4 = true;
+    } else if (dp_packet_hwol_is_ipv4(p)) {
+        is_v4 = true;
     } else if (dp_packet_hwol_tx_ipv6(p)) {
-        struct ovs_16aligned_ip6_hdr *ip6 = dp_packet_l3(p);
-
-        udp->udp_csum = packet_csum_upperlayer6(ip6, udp, ip6->ip6_nxt,
-                                                dp_packet_l4_size(p));
+        is_v4 = false;
     } else {
         OVS_NOT_REACHED();
+    }
+
+    udp->udp_csum = 0;
+    if (is_v4) {
+        struct ip_header *ip = ip_hdr;
+
+        udp->udp_csum = csum_finish(csum_continue(packet_csum_pseudoheader(ip),
+                                                  udp, udp_sz));
+    } else {
+        struct ovs_16aligned_ip6_hdr *ip6 = ip_hdr;
+
+        udp->udp_csum = packet_csum_upperlayer6(ip6, udp, ip6->ip6_nxt,
+                                                udp_sz);
     }
 
     if (!udp->udp_csum) {
@@ -2052,11 +2101,21 @@ packet_udp_complete_csum(struct dp_packet *p)
 /* Set SCTP checksum field in packet 'p' with complete checksum.
  * The packet must have the L3 and L4 offsets. */
 void
-packet_sctp_complete_csum(struct dp_packet *p)
+packet_sctp_complete_csum(struct dp_packet *p, bool inner)
 {
-    struct sctp_header *sh = dp_packet_l4(p);
-    uint16_t tp_len = dp_packet_l4_size(p);
+    struct sctp_header *sh;
+    uint16_t tp_len;
     ovs_be32 csum;
+
+    if (inner) {
+        sh = dp_packet_inner_l4(p);
+        tp_len = dp_packet_inner_l4_size(p);
+    } else {
+        sh = dp_packet_l4(p);
+        tp_len = dp_packet_l4_size(p);
+    }
+
+    ovs_assert(sh);
 
     put_16aligned_be32(&sh->sctp_csum, 0);
     csum = crc32c((void *) sh, tp_len);

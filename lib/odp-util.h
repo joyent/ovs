@@ -171,7 +171,7 @@ void odp_format_ufid(const ovs_u128 *ufid, struct ds *);
 void odp_flow_format(const struct nlattr *key, size_t key_len,
                      const struct nlattr *mask, size_t mask_len,
                      const struct hmap *portno_names, struct ds *,
-                     bool verbose);
+                     bool verbose, bool skip_no_mask);
 void odp_flow_key_format(const struct nlattr *, size_t, struct ds *);
 int odp_flow_from_string(const char *s, const struct simap *port_names,
                          struct ofpbuf *, struct ofpbuf *, char **errorp);
@@ -376,6 +376,9 @@ void odp_put_pop_eth_action(struct ofpbuf *odp_actions);
 void odp_put_push_eth_action(struct ofpbuf *odp_actions,
                              const struct eth_addr *eth_src,
                              const struct eth_addr *eth_dst);
+void odp_put_psample_action(struct ofpbuf *odp_actions,
+                            uint32_t group_id, uint8_t *cookie,
+                            size_t cookie_len);
 
 static inline void odp_decode_gbp_raw(uint32_t gbp_raw,
                                       ovs_be16 *id,

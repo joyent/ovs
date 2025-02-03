@@ -29,6 +29,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "async-append.h"
+#include "backtrace.h"
 #include "coverage.h"
 #include "dirs.h"
 #include "openvswitch/dynamic-string.h"
@@ -395,7 +396,9 @@ vlog_set_log_file__(char *new_log_file_name)
                   && old_stat.st_ino == new_stat.st_ino));
     ovs_mutex_unlock(&log_file_mutex);
     if (same_file) {
-        close(new_log_fd);
+        if (new_log_fd >= 0) {
+            close(new_log_fd);
+        }
         free(new_log_file_name);
         return 0;
     }
@@ -410,10 +413,10 @@ vlog_set_log_file__(char *new_log_file_name)
 
     /* Close old log file, if any. */
     ovs_mutex_lock(&log_file_mutex);
+    async_append_destroy(log_writer);
     if (log_fd >= 0) {
         close(log_fd);
     }
-    async_append_destroy(log_writer);
     free(log_file_name);
 
     /* Install new log file. */
@@ -823,6 +826,14 @@ vlog_disable_rate_limit(struct unixctl_conn *conn, int argc,
     set_rate_limits(conn, argc, argv, false);
 }
 
+static void
+vlog_inject_info_log(struct unixctl_conn *conn, int argc OVS_UNUSED,
+                     const char *argv[], void *aux OVS_UNUSED)
+{
+    VLOG_INFO("user-message: %s", argv[1]);
+    unixctl_command_reply(conn, NULL);
+}
+
 /* Initializes the logging subsystem and registers its unixctl server
  * commands. */
 void
@@ -875,6 +886,8 @@ vlog_init(void)
                                  vlog_unixctl_reopen, NULL);
         unixctl_command_register("vlog/close", "", 0, 0,
                                  vlog_unixctl_close, NULL);
+        unixctl_command_register("vlog/message", NULL, 1, 1,
+                                 vlog_inject_info_log, NULL);
 
         ovs_rwlock_rdlock(&pattern_rwlock);
         print_syslog_target_deprecation = syslog_fd >= 0;
@@ -1274,8 +1287,9 @@ vlog_fatal(const struct vlog_module *module, const char *message, ...)
     va_end(args);
 }
 
-/* Logs 'message' to 'module' at maximum verbosity, then calls abort().  Always
- * writes the message to stderr, even if the console destination is disabled.
+/* Attempts to log a stack trace, logs 'message' to 'module' at maximum
+ * verbosity, then calls abort().  Always writes the message to stderr, even
+ * if the console destination is disabled.
  *
  * Choose this function instead of vlog_fatal_valist() if the daemon monitoring
  * facility should automatically restart the current daemon.  */
@@ -1289,6 +1303,10 @@ vlog_abort_valist(const struct vlog_module *module_,
      * message written by the later ovs_abort_valist(). */
     module->levels[VLF_CONSOLE] = VLL_OFF;
 
+    /* Printing the stack trace before the 'message', because the 'message'
+     * will flush the async log queue (VLL_EMER).  With a different order we
+     * would need to flush the queue manually again. */
+    log_backtrace();
     vlog_valist(module, VLL_EMER, message, args);
     ovs_abort_valist(0, message, args);
 }

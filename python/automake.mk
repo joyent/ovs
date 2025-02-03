@@ -63,6 +63,24 @@ ovs_pytests = \
 	python/ovs/tests/test_odp.py \
 	python/ovs/tests/test_ofp.py
 
+ovs_flowviz = \
+	python/ovs/flowviz/__init__.py \
+	python/ovs/flowviz/console.py \
+	python/ovs/flowviz/format.py \
+	python/ovs/flowviz/html_format.py \
+	python/ovs/flowviz/main.py \
+	python/ovs/flowviz/odp/__init__.py \
+	python/ovs/flowviz/odp/cli.py \
+	python/ovs/flowviz/odp/graph.py \
+	python/ovs/flowviz/odp/html.py \
+	python/ovs/flowviz/odp/tree.py \
+	python/ovs/flowviz/ofp/__init__.py \
+	python/ovs/flowviz/ofp/cli.py \
+	python/ovs/flowviz/ofp/logic.py \
+	python/ovs/flowviz/ofp/html.py \
+	python/ovs/flowviz/ovs-flowviz \
+	python/ovs/flowviz/process.py
+
 # These python files are used at build time but not runtime,
 # so they are not installed.
 EXTRA_DIST += \
@@ -74,6 +92,7 @@ EXTRA_DIST += \
 # PyPI support.
 EXTRA_DIST += \
 	python/ovs/compat/sortedcontainers/LICENSE \
+	python/ovs/flowviz/ovs-flowviz.conf \
 	python/README.rst \
 	python/setup.py \
 	python/test_requirements.txt
@@ -81,21 +100,24 @@ EXTRA_DIST += \
 # C extension support.
 EXTRA_DIST += python/ovs/_json.c
 
-PYFILES = $(ovs_pyfiles) python/ovs/dirs.py $(ovstest_pyfiles) $(ovs_pytests)
+PYFILES = $(ovs_pyfiles) python/ovs/dirs.py python/setup.py $(ovstest_pyfiles) $(ovs_pytests) \
+	$(ovs_flowviz)
 
 EXTRA_DIST += $(PYFILES)
-PYCOV_CLEAN_FILES += $(PYFILES:.py=.py,cover)
+PYCOV_CLEAN_FILES += $($(filter %.py, PYFILES):.py=.py,cover) python/ovs/flowviz/ovs-flowviz,cover
 
 FLAKE8_PYFILES += \
-	$(filter-out python/ovs/compat/% python/ovs/dirs.py,$(PYFILES)) \
+	$(filter-out python/ovs/compat/% python/ovs/dirs.py python/setup.py,$(PYFILES)) \
 	python/ovs_build_helpers/__init__.py \
 	python/ovs_build_helpers/extract_ofp_fields.py \
 	python/ovs_build_helpers/nroff.py \
 	python/ovs_build_helpers/soutil.py \
 	python/ovs/dirs.py.template \
-	python/setup.py
+	python/setup.py.template
 
-nobase_pkgdata_DATA = $(ovs_pyfiles) $(ovstest_pyfiles)
+nobase_pkgdata_DATA = $(ovs_pyfiles) $(ovstest_pyfiles) $(ovs_flowviz)
+nobase_pkgdata_DATA += python/ovs/flowviz/ovs-flowviz.conf
+
 ovs-install-data-local:
 	$(MKDIR_P) python/ovs
 	sed \
@@ -113,7 +135,7 @@ ovs-install-data-local:
 	rm python/ovs/dirs.py.tmp
 
 .PHONY: python-sdist
-python-sdist: $(srcdir)/python/ovs/version.py $(ovs_pyfiles) python/ovs/dirs.py
+python-sdist: $(srcdir)/python/ovs/version.py $(ovs_pyfiles) python/ovs/dirs.py python/setup.py
 	cd python/ && $(PYTHON3) -m build --sdist
 
 .PHONY: pypi-upload
@@ -129,8 +151,8 @@ ovs-uninstall-local:
 ALL_LOCAL += $(srcdir)/python/ovs/version.py
 $(srcdir)/python/ovs/version.py: config.status
 	$(AM_V_GEN)$(ro_shell) > $(@F).tmp && \
-	echo 'VERSION = "$(VERSION)"' >> $(@F).tmp && \
-	if cmp -s $(@F).tmp $@; then touch $@; rm $(@F).tmp; else mv $(@F).tmp $@; fi
+	echo 'VERSION = "$(VERSION)$(VERSION_SUFFIX)"' >> $(@F).tmp && \
+	if cmp -s $(@F).tmp $@; then touch $@; else cp $(@F).tmp $@; fi; rm $(@F).tmp
 
 ALL_LOCAL += $(srcdir)/python/ovs/dirs.py
 $(srcdir)/python/ovs/dirs.py: python/ovs/dirs.py.template
@@ -146,6 +168,15 @@ $(srcdir)/python/ovs/dirs.py: python/ovs/dirs.py.template
 	mv $@.tmp $@
 EXTRA_DIST += python/ovs/dirs.py.template
 CLEANFILES += python/ovs/dirs.py
+
+ALL_LOCAL += $(srcdir)/python/setup.py
+$(srcdir)/python/setup.py: python/setup.py.template config.status
+	$(AM_V_GEN)sed \
+		-e 's,[@]VERSION[@],$(VERSION),g' \
+		< $(srcdir)/python/setup.py.template > $(@F).tmp && \
+	if cmp -s $(@F).tmp $@; then touch $@; else cp $(@F).tmp $@; fi; rm $(@F).tmp
+EXTRA_DIST += python/setup.py.template
+CLEANFILES += python/setup.py
 
 EXTRA_DIST += python/TODO.rst
 

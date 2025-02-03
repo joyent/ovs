@@ -351,7 +351,7 @@ def args_get():
     # None is a special value indicating to read flows from stdin.
     # This handles the case
     #   ovs-dpctl dump-flows | ovs-dpctl-flows.py
-    parser.add_argument("-v", "--version", version="@VERSION@",
+    parser.add_argument("-v", "--version", version="@VERSION@@VERSION_SUFFIX@",
                         action="version", help="show version")
     parser.add_argument("-f", "--flow-file", dest="flowFiles", default=None,
                         action="append",
@@ -389,10 +389,10 @@ def args_get():
 # Code to parse a single line in dump-flow
 ###
 # key(values)
-FIELDS_CMPND = re.compile("([\w]+)\((.+)\)")
+FIELDS_CMPND = re.compile(r"([\w]+)\((.+)\)")
 # key:value
-FIELDS_CMPND_ELEMENT = re.compile("([\w:]+)=([/\.\w:]+)")
-FIELDS_ELEMENT = re.compile("([\w]+):([-\.\w]+)")
+FIELDS_CMPND_ELEMENT = re.compile(r"([\w:]+)=([/\.\w:]+)")
+FIELDS_ELEMENT = re.compile(r"([\w]+):([-\.\w]+)")
 
 
 def flow_line_iter(line):
@@ -1007,7 +1007,7 @@ class FlowDB:
     def decay(self, decayTimeInSeconds):
         """ Decay content. """
         now = datetime.datetime.now()
-        for (key, value) in self._flows.items():
+        for (key, value) in list(self._flows.items()):
             (stats_dict, updateTime) = value
             delta = now - updateTime
 

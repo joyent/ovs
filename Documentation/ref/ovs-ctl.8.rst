@@ -170,8 +170,9 @@ The following options are less important:
 * ``--no-mlockall``
 
   By default ``ovs-ctl`` passes ``--mlockall`` to ``ovs-vswitchd``,
-  requesting that it lock all of its virtual memory, preventing it
-  from being paged to disk.  This option suppresses that behavior.
+  requesting that it lock all of its virtual memory on page fault (on
+  allocation, when running on Linux kernel 4.4 and older), preventing
+  it from being paged to disk.  This option suppresses that behavior.
 
 * ``--no-self-confinement``
 
@@ -192,6 +193,11 @@ The following options are less important:
   - You don't have much worries of remote OVSDB exploits in the first
     place, because, perhaps, OVSDB manager is running on the same host
     as OVS and share similar attack vectors.
+
+* ``--oom-score=<score>``
+
+  Sets the Linux Out-Of-Memory (OOM) killer score for the OVS daemon
+  after it's been started.
 
 * ``--ovsdb-server-priority=<niceness>`` or
   ``--ovs-vswitchd-priority=<niceness>``

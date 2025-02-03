@@ -323,7 +323,6 @@ dpdk_init__(const struct smap *ovs_other_config)
     if (log_stream == NULL) {
         VLOG_ERR("Can't redirect DPDK log: %s.", ovs_strerror(errno));
     } else {
-        setbuf(log_stream, NULL);
         rte_openlog_stream(log_stream);
     }
 
@@ -337,7 +336,9 @@ dpdk_init__(const struct smap *ovs_other_config)
     }
 #endif
 
-    if (args_contains(&args, "-c") || args_contains(&args, "-l")) {
+    if (args_contains(&args, "-c") ||
+        args_contains(&args, "-l") ||
+        args_contains(&args, "--lcores")) {
         auto_determine = false;
     }
 
@@ -436,6 +437,8 @@ dpdk_init__(const struct smap *ovs_other_config)
     unixctl_command_register("dpdk/get-malloc-stats", "", 0, 0,
                              dpdk_unixctl_mem_stream,
                              malloc_dump_stats_wrapper);
+    unixctl_command_register("dpdk/get-memzone-stats", "", 0, 0,
+                             dpdk_unixctl_mem_stream, rte_memzone_dump);
 
     /* We are called from the main thread here */
     RTE_PER_LCORE(_lcore_id) = NON_PMD_CORE_ID;

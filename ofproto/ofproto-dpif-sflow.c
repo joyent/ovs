@@ -808,7 +808,7 @@ dpif_sflow_set_options(struct dpif_sflow *ds,
 
     receiver = sfl_agent_addReceiver(ds->sflow_agent);
     sfl_receiver_set_sFlowRcvrOwner(receiver, "Open vSwitch sFlow");
-    sfl_receiver_set_sFlowRcvrTimeout(receiver, 0xffffffff);
+    sfl_receiver_set_sFlowRcvrTimeout(receiver, UINT32_MAX);
 
     /* Set the sampling_rate down in the datapath. */
     ds->probability = MAX(1, UINT32_MAX / ds->options->sampling_rate);
@@ -1236,6 +1236,8 @@ dpif_sflow_read_actions(const struct flow *flow,
         case OVS_ACTION_ATTR_CHECK_PKT_LEN:
         case OVS_ACTION_ATTR_DROP:
         case OVS_ACTION_ATTR_ADD_MPLS:
+        case OVS_ACTION_ATTR_DEC_TTL:
+        case OVS_ACTION_ATTR_PSAMPLE:
         case __OVS_ACTION_ATTR_MAX:
         default:
             break;

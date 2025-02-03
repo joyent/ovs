@@ -28,6 +28,7 @@
 #include "dpctl.h"
 #include "dpif-netdev.h"
 #include "flow.h"
+#include "netdev-offload.h"
 #include "netdev-provider.h"
 #include "netdev.h"
 #include "netlink.h"
@@ -1191,6 +1192,8 @@ dpif_execute_helper_cb(void *aux_, struct dp_packet_batch *packets_,
     case OVS_ACTION_ATTR_TUNNEL_PUSH:
     case OVS_ACTION_ATTR_TUNNEL_POP:
     case OVS_ACTION_ATTR_USERSPACE:
+    case OVS_ACTION_ATTR_PSAMPLE:
+    case OVS_ACTION_ATTR_SAMPLE:
     case OVS_ACTION_ATTR_RECIRC: {
         struct dpif_execute execute;
         struct ofpbuf execute_actions;
@@ -1277,7 +1280,6 @@ dpif_execute_helper_cb(void *aux_, struct dp_packet_batch *packets_,
     case OVS_ACTION_ATTR_POP_MPLS:
     case OVS_ACTION_ATTR_SET:
     case OVS_ACTION_ATTR_SET_MASKED:
-    case OVS_ACTION_ATTR_SAMPLE:
     case OVS_ACTION_ATTR_TRUNC:
     case OVS_ACTION_ATTR_PUSH_ETH:
     case OVS_ACTION_ATTR_POP_ETH:
@@ -1289,6 +1291,7 @@ dpif_execute_helper_cb(void *aux_, struct dp_packet_batch *packets_,
     case OVS_ACTION_ATTR_CHECK_PKT_LEN:
     case OVS_ACTION_ATTR_DROP:
     case OVS_ACTION_ATTR_ADD_MPLS:
+    case OVS_ACTION_ATTR_DEC_TTL:
     case __OVS_ACTION_ATTR_MAX:
         OVS_NOT_REACHED();
     }
@@ -1802,12 +1805,12 @@ log_flow_message(const struct dpif *dpif, int error,
         odp_format_ufid(ufid, &ds);
         ds_put_cstr(&ds, " ");
     }
-    odp_flow_format(key, key_len, mask, mask_len, NULL, &ds, true);
+    odp_flow_format(key, key_len, mask, mask_len, NULL, &ds, true, true);
     if (stats) {
         ds_put_cstr(&ds, ", ");
         dpif_flow_stats_format(stats, &ds);
     }
-    if (actions || actions_len) {
+    if (actions) {
         ds_put_cstr(&ds, ", actions:");
         format_odp_actions(&ds, actions, actions_len, NULL);
     }
@@ -1903,7 +1906,7 @@ log_execute_message(const struct dpif *dpif,
         }
         ds_put_format(&ds, " on packet %s", packet);
         ds_put_format(&ds, " with metadata ");
-        odp_flow_format(md.data, md.size, NULL, 0, NULL, &ds, true);
+        odp_flow_format(md.data, md.size, NULL, 0, NULL, &ds, true, false);
         ds_put_format(&ds, " mtu %d", execute->mtu);
         vlog(module, error ? VLL_WARN : VLL_DBG, "%s", ds_cstr(&ds));
         ds_destroy(&ds);
@@ -1934,9 +1937,10 @@ dpif_supports_tnl_push_pop(const struct dpif *dpif)
 }
 
 bool
-dpif_supports_explicit_drop_action(const struct dpif *dpif)
+dpif_may_support_explicit_drop_action(const struct dpif *dpif)
 {
-    return dpif_is_netdev(dpif);
+    /* TC does not support offloading this action. */
+    return dpif_is_netdev(dpif) || !netdev_is_flow_api_enabled();
 }
 
 bool
@@ -1947,6 +1951,13 @@ dpif_supports_lb_output_action(const struct dpif *dpif)
      * datapath only.
      */
     return dpif_is_netdev(dpif);
+}
+
+bool
+dpif_may_support_psample(const struct dpif *dpif)
+{
+    /* Userspace datapath does not support this action. */
+    return !dpif_is_netdev(dpif);
 }
 
 /* Meters */

@@ -71,8 +71,10 @@ static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
 #define MF_VALUE_EXACT_64 MF_VALUE_EXACT_32, MF_VALUE_EXACT_32
 #define MF_VALUE_EXACT_128 MF_VALUE_EXACT_64, MF_VALUE_EXACT_64
 #define MF_VALUE_EXACT_INITIALIZER { .tun_metadata = { MF_VALUE_EXACT_128 } }
+#define MF_SUBVALUE_EXACT_INITIALIZER { .u8 = { MF_VALUE_EXACT_128 } }
 
 const union mf_value exact_match_mask = MF_VALUE_EXACT_INITIALIZER;
+const union mf_subvalue exact_sub_match_mask = MF_SUBVALUE_EXACT_INITIALIZER;
 
 static void nxm_init(void);
 
@@ -1789,6 +1791,115 @@ mf_is_tun_metadata(const struct mf_field *mf)
 }
 
 bool
+mf_is_any_metadata(const struct mf_field *mf)
+{
+    switch (mf->id) {
+    case MFF_DP_HASH:
+    case MFF_RECIRC_ID:
+    case MFF_PACKET_TYPE:
+    case MFF_CONJ_ID:
+    case MFF_TUN_ERSPAN_DIR:
+    CASE_MFF_TUN_METADATA:
+    case MFF_METADATA:
+    case MFF_IN_PORT:
+    case MFF_IN_PORT_OXM:
+    case MFF_ACTSET_OUTPUT:
+    case MFF_SKB_PRIORITY:
+    case MFF_PKT_MARK:
+    case MFF_CT_STATE:
+    case MFF_CT_ZONE:
+    case MFF_CT_MARK:
+    case MFF_CT_LABEL:
+    case MFF_CT_NW_PROTO:
+    case MFF_CT_NW_SRC:
+    case MFF_CT_NW_DST:
+    case MFF_CT_IPV6_SRC:
+    case MFF_CT_IPV6_DST:
+    case MFF_CT_TP_SRC:
+    case MFF_CT_TP_DST:
+    CASE_MFF_REGS:
+    CASE_MFF_XREGS:
+    CASE_MFF_XXREGS:
+        return true;
+
+    case MFF_TUN_ID:
+    case MFF_TUN_SRC:
+    case MFF_TUN_DST:
+    case MFF_TUN_IPV6_SRC:
+    case MFF_TUN_IPV6_DST:
+    case MFF_TUN_FLAGS:
+    case MFF_TUN_TTL:
+    case MFF_TUN_TOS:
+    case MFF_TUN_GBP_ID:
+    case MFF_TUN_GBP_FLAGS:
+    case MFF_TUN_ERSPAN_IDX:
+    case MFF_TUN_ERSPAN_VER:
+    case MFF_TUN_ERSPAN_HWID:
+    case MFF_TUN_GTPU_FLAGS:
+    case MFF_TUN_GTPU_MSGTYPE:
+    case MFF_ETH_SRC:
+    case MFF_ETH_DST:
+    case MFF_ETH_TYPE:
+    case MFF_VLAN_TCI:
+    case MFF_DL_VLAN:
+    case MFF_VLAN_VID:
+    case MFF_DL_VLAN_PCP:
+    case MFF_VLAN_PCP:
+    case MFF_MPLS_LABEL:
+    case MFF_MPLS_TC:
+    case MFF_MPLS_BOS:
+    case MFF_MPLS_TTL:
+    case MFF_IPV4_SRC:
+    case MFF_IPV4_DST:
+    case MFF_IPV6_SRC:
+    case MFF_IPV6_DST:
+    case MFF_IPV6_LABEL:
+    case MFF_IP_PROTO:
+    case MFF_IP_DSCP:
+    case MFF_IP_DSCP_SHIFTED:
+    case MFF_IP_ECN:
+    case MFF_IP_TTL:
+    case MFF_IP_FRAG:
+    case MFF_ARP_OP:
+    case MFF_ARP_SPA:
+    case MFF_ARP_TPA:
+    case MFF_ARP_SHA:
+    case MFF_ARP_THA:
+    case MFF_TCP_SRC:
+    case MFF_TCP_DST:
+    case MFF_TCP_FLAGS:
+    case MFF_UDP_SRC:
+    case MFF_UDP_DST:
+    case MFF_SCTP_SRC:
+    case MFF_SCTP_DST:
+    case MFF_ICMPV4_TYPE:
+    case MFF_ICMPV4_CODE:
+    case MFF_ICMPV6_TYPE:
+    case MFF_ICMPV6_CODE:
+    case MFF_ND_TARGET:
+    case MFF_ND_SLL:
+    case MFF_ND_TLL:
+    case MFF_ND_RESERVED:
+    case MFF_ND_OPTIONS_TYPE:
+    case MFF_NSH_FLAGS:
+    case MFF_NSH_MDTYPE:
+    case MFF_NSH_NP:
+    case MFF_NSH_SPI:
+    case MFF_NSH_SI:
+    case MFF_NSH_C1:
+    case MFF_NSH_C2:
+    case MFF_NSH_C3:
+    case MFF_NSH_C4:
+    case MFF_NSH_TTL:
+        return false;
+
+    case MFF_N_IDS:
+    default:
+        OVS_NOT_REACHED();
+    }
+}
+
+bool
 mf_is_frozen_metadata(const struct mf_field *mf)
 {
     if (mf->id >= MFF_TUN_ID && mf->id <= MFF_IN_PORT_OXM) {
@@ -2543,7 +2654,8 @@ mf_set(const struct mf_field *mf,
         break;
 
     case MFF_IP_FRAG:
-        match_set_nw_frag_masked(match, value->u8, mask->u8);
+        match_set_nw_frag_masked(match, value->u8,
+                                 mask->u8 & FLOW_NW_FRAG_MASK);
         break;
 
     case MFF_ARP_SPA:
@@ -2751,8 +2863,8 @@ static char *
 mf_from_integer_string(const struct mf_field *mf, const char *s,
                        uint8_t *valuep, uint8_t *maskp)
 {
+    const char *err_str;
     char *tail;
-    const char *err_str = "";
     int err;
 
     err = parse_int_string(s, valuep, mf->n_bytes, &tail);
@@ -2785,8 +2897,8 @@ syntax_error:
 static char *
 mf_from_packet_type_string(const char *s, ovs_be32 *packet_type)
 {
+    const char *err_str;
     char *tail;
-    const char *err_str = "";
     int err;
 
     if (*s != '(') {

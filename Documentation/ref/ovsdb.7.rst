@@ -155,6 +155,22 @@ standalone database, configure the server to listen on a "connection method"
 that the client can reach, then point the client to that connection method.
 See `Connection Methods`_ below for information about connection methods.
 
+Open vSwitch 3.3 introduced support for configuration files via
+``--config-file`` command line option.  The configuration file for a server
+with a **standalone** database may look like this::
+
+  {
+      "remotes": { "<connection method>": {} },
+      "databases": { "<database file>": {} }
+  }
+
+``ovsdb-server`` will infer the service model from the database file itself.
+However, if additional verification is desired, an optional
+``"service-model": "standalone"`` can be provided for the database file inside
+the inner curly braces.  If the specified ``service-model`` will not match the
+content of the database file, ``ovsdb-server`` will refuse to open this
+database.
+
 Active-Backup Database Service Model
 ------------------------------------
 
@@ -177,10 +193,36 @@ database file from the active server.  Then use
 connects to the active server.  At that point, the backup server will fetch a
 copy of the active database and keep it up-to-date until it is killed.
 
+Open vSwitch 3.3 introduced support for configuration files via
+``--config-file`` command line option.  The configuration file for a backup
+server in this case may look like this::
+
+  {
+      "remotes": { "<connection method>": {} },
+      "databases": {
+          "<database file>": {
+              "service-model": "active-backup",
+              "backup": true,
+              "source": {
+                  "<active>": {
+                      "inactivity-probe": <integer>,
+                      "max-backoff": <integer>
+                  }
+              }
+          }
+      }
+  }
+
+All the fields in the ``"<database file>"`` description above are required.
+Options for the ``"<active>"`` connection method (``"inactivity-probe"``, etc.)
+can be omitted.
+
 When the active server in an active-backup server pair fails, an administrator
 can switch the backup server to an active role with the ``ovs-appctl`` command
 ``ovsdb-server/disconnect-active-ovsdb-server``.  Clients then have read/write
-access to the now-active server.  Of course, administrators are slow to respond
+access to the now-active server.  When the ``--config-file`` is in use, the
+same can be achieved by changing the ``"backup"`` value in the file and running
+``ovsdb-server/reload`` command.  Of course, administrators are slow to respond
 compared to software, so in practice external management software detects the
 active server's failure and changes the backup server's role.  For example, the
 "Integration Guide for Centralized Control" in the OVN documentation describes
@@ -236,6 +278,22 @@ To set up a clustered database, first initialize it on a single node by running
 arguments, the ``create-cluster`` command can create an empty database or copy
 a standalone database's contents into the new database.
 
+Open vSwitch 3.3 introduced support for configuration files via
+``--config-file`` command line option.  The configuration file for a server
+with a **clustered** database may look like this::
+
+  {
+      "remotes": { "<connection method>": {} },
+      "databases": { "<database file>": {} }
+  }
+
+``ovsdb-server`` will infer the service model from the database file itself.
+However, if additional verification is desired, an optional
+``"service-model": "clustered"`` can be provided for the database file inside
+the inner curly braces.  If the specified ``service-model`` will not match the
+content of the database file, ``ovsdb-server`` will refuse to open this
+database.
+
 To configure a client to use a clustered database, first configure all of the
 servers to listen on a connection method that the client can reach, then point
 the client to all of the servers' connection methods, comma-separated.  See
@@ -257,16 +315,11 @@ The above methods for adding and removing servers only work for healthy
 clusters, that is, for clusters with no more failures than their maximum
 tolerance.  For example, in a 3-server cluster, the failure of 2 servers
 prevents servers joining or leaving the cluster (as well as database access).
+
 To prevent data loss or inconsistency, the preferred solution to this problem
 is to bring up enough of the failed servers to make the cluster healthy again,
 then if necessary remove any remaining failed servers and add new ones.  If
-this cannot be done, though, use ``ovs-appctl`` to invoke ``cluster/leave
---force`` on a running server.  This command forces the server to which it is
-directed to leave its cluster and form a new single-node cluster that contains
-only itself.  The data in the new cluster may be inconsistent with the former
-cluster: transactions not yet replicated to the server will be lost, and
-transactions not yet applied to the cluster may be committed.  Afterward, any
-servers in its former cluster will regard the server to have failed.
+this is not an option, see the next section for `Manual cluster recovery`_.
 
 Once a server leaves a cluster, it may never rejoin it.  Instead, create a new
 server and join it to the cluster.
@@ -303,6 +356,40 @@ Clustered OVSDB does not support the OVSDB "ephemeral columns" feature.
 ``ovsdb-tool`` and ``ovsdb-client`` change ephemeral columns into persistent
 ones when they work with schemas for clustered databases.  Future versions of
 OVSDB might add support for this feature.
+
+Manual cluster recovery
+~~~~~~~~~~~~~~~~~~~~~~~
+
+.. important::
+
+   The procedure below will result in ``cid`` and ``sid`` change.  A *new*
+   cluster will be initialized.
+
+To recover a clustered database after a failure:
+
+1. Stop *all* old cluster ``ovsdb-server`` instances before proceeding.
+
+2. Pick one of the old members which will serve as a bootstrap member of the
+   to-be-recovered cluster.
+
+3. Convert its database file to the standalone format using ``ovsdb-tool
+   cluster-to-standalone``.
+
+4. Backup the standalone database file.
+
+5. Create a new single-node cluster with ``ovsdb-tool create-cluster``
+   using the previously saved standalone database file, then start
+   ``ovsdb-server``.
+
+6. Once the single-node cluster is up and running and serves the restored data,
+   new members should be created and added to the cluster, as usual, with
+   ``ovsdb-tool join-cluster``.
+
+.. note::
+
+   The data in the new cluster may be inconsistent with the former cluster:
+   transactions not yet replicated to the server chosen in step 2 will be lost,
+   and transactions not yet applied to the cluster may be committed.
 
 Upgrading from version 2.14 and earlier to 2.15 and later
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -505,6 +592,29 @@ server.  ``<relay source>`` could contain a comma-separated list of connection
 methods, e.g. to connect to any server of the clustered database.
 Multiple relay servers could be started for the same relay source.
 
+Open vSwitch 3.3 introduced support for configuration files via
+``--config-file`` command line option.  The configuration file for a relay
+database server in this case may look like this::
+
+  {
+      "remotes": { "<connection method>": {} },
+      "databases": {
+          "<DB_NAME>": {
+              "service-model": "relay",
+              "source": {
+                  "<relay source>": {
+                      "inactivity-probe": <integer>,
+                      "max-backoff": <integer>
+                  }
+              }
+          }
+      }
+  }
+
+Both the ``"service-model"`` and the ``"source"`` are required.  Options for
+the ``"<relay source>"`` connection method (``"inactivity-probe"``, etc.)
+can be omitted.
+
 Since the way relays handle read and write transactions is very similar
 to the clustered model where "cluster" means "set of relay servers connected
 to the same relay source", "follower" means "relay server" and the "leader"
@@ -555,7 +665,7 @@ the opposite arrangement as well.
 OVSDB supports the following active connection methods:
 
 ssl:<host>:<port>
-    The specified SSL or TLS <port> on the given <host>.
+    The specified SSL/TLS <port> on the given <host>.
 
 tcp:<host>:<port>
     The specified TCP <port> on the given <host>.
@@ -582,7 +692,7 @@ unix:<file>
 OVSDB supports the following passive connection methods:
 
 pssl:<port>[:<ip>]
-    Listen on the given TCP <port> for SSL or TLS connections.  By default,
+    Listen on the given TCP <port> for SSL/TLS connections.  By default,
     connections are not bound to a particular local IP address.  Specifying
     <ip> limits connections to those from the given IP.
 
@@ -615,8 +725,8 @@ versions, we encourage users to specify a port number.
 
 The ``ssl`` and ``pssl`` connection methods requires additional configuration
 through ``--private-key``, ``--certificate``, and ``--ca-cert`` command line
-options.  Open vSwitch can be built without SSL support, in which case these
-connection methods are not supported.
+options.  Open vSwitch can be built without SSL/TLS support, in which case
+these connection methods are not supported.
 
 Database Life Cycle
 ===================
@@ -629,7 +739,8 @@ Creating a Database
 
 Creating and starting up the service for a new database was covered
 separately for each database service model in the `Service
-Models`_ section, above.
+Models`_ section, above.  A single ``ovsdb-server`` process may serve
+any number of databases with different service models at the same time.
 
 Backing Up and Restoring a Database
 -----------------------------------

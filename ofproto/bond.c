@@ -186,13 +186,14 @@ static struct bond_member *choose_output_member(const struct bond *,
                                                 struct flow_wildcards *,
                                                 uint16_t vlan)
     OVS_REQ_RDLOCK(rwlock);
-static void update_recirc_rules__(struct bond *);
+static void update_recirc_rules(struct bond *) OVS_REQ_WRLOCK(rwlock);
 static bool bond_may_recirc(const struct bond *);
 static void bond_update_post_recirc_rules__(struct bond *, bool force)
     OVS_REQ_WRLOCK(rwlock);
 static bool bond_is_falling_back_to_ab(const struct bond *);
 static void bond_add_lb_output_buckets(const struct bond *);
 static void bond_del_lb_output_buckets(const struct bond *);
+static bool bond_is_balanced(const struct bond *bond) OVS_REQ_RDLOCK(rwlock);
 
 
 /* Attempts to parse 's' as the name of a bond balancing mode.  If successful,
@@ -246,7 +247,7 @@ bond_create(const struct bond_settings *s, struct ofproto_dpif *ofproto)
     ovs_refcount_init(&bond->ref_cnt);
     hmap_init(&bond->pr_rule_ops);
 
-    bond->active_member_mac = eth_addr_zero;
+    bond->active_member_mac = s->active_member_mac;
     bond->active_member_changed = false;
     bond->primary = NULL;
 
@@ -299,7 +300,10 @@ bond_unref(struct bond *bond)
     }
     free(bond->hash);
     bond->hash = NULL;
-    update_recirc_rules__(bond);
+
+    ovs_rwlock_wrlock(&rwlock);
+    update_recirc_rules(bond);
+    ovs_rwlock_unlock(&rwlock);
 
     hmap_destroy(&bond->pr_rule_ops);
     free(bond->primary);
@@ -331,17 +335,8 @@ add_pr_rule(struct bond *bond, const struct match *match,
     hmap_insert(&bond->pr_rule_ops, &pr_op->hmap_node, hash);
 }
 
-/* This function should almost never be called directly.
- * 'update_recirc_rules()' should be called instead.  Since
- * this function modifies 'bond->pr_rule_ops', it is only
- * safe when 'rwlock' is held.
- *
- * However, when the 'bond' is the only reference in the system,
- * calling this function avoid acquiring lock only to satisfy
- * lock annotation. Currently, only 'bond_unref()' calls
- * this function directly.  */
 static void
-update_recirc_rules__(struct bond *bond)
+update_recirc_rules(struct bond *bond) OVS_REQ_WRLOCK(rwlock)
 {
     struct match match;
     struct bond_pr_rule_op *pr_op;
@@ -407,6 +402,15 @@ update_recirc_rules__(struct bond *bond)
 
                 VLOG_ERR("failed to remove post recirculation flow %s", err_s);
                 free(err_s);
+            } else if (bond->hash) {
+                /* If the flow deletion failed, a subsequent call to
+                 * ofproto_dpif_add_internal_flow() would just modify the
+                 * flow preserving its statistics.  Therefore, only reset
+                 * the entry's byte counter if it succeeds. */
+                uint32_t hash = pr_op->match.flow.dp_hash & BOND_MASK;
+                struct bond_entry *entry = &bond->hash[hash];
+
+                entry->pr_tx_bytes = 0;
             }
 
             hmap_remove(&bond->pr_rule_ops, &pr_op->hmap_node);
@@ -421,12 +425,6 @@ update_recirc_rules__(struct bond *bond)
     ofpbuf_uninit(&ofpacts);
 }
 
-static void
-update_recirc_rules(struct bond *bond)
-    OVS_REQ_RDLOCK(rwlock)
-{
-    update_recirc_rules__(bond);
-}
 
 /* Updates 'bond''s overall configuration to 's'.
  *
@@ -552,6 +550,7 @@ bond_find_member_by_mac(const struct bond *bond, const struct eth_addr mac)
 
 static void
 bond_active_member_changed(struct bond *bond)
+    OVS_REQ_WRLOCK(rwlock)
 {
     if (bond->active_member) {
         struct eth_addr mac;
@@ -561,6 +560,9 @@ bond_active_member_changed(struct bond *bond)
         bond->active_member_mac = eth_addr_zero;
     }
     bond->active_member_changed = true;
+    if (!bond_is_balanced(bond)) {
+        bond->bond_revalidate = true;
+    }
     seq_change(connectivity_seq_get());
 }
 
@@ -1124,7 +1126,7 @@ bond_get_recirc_id_and_hash_basis(struct bond *bond, uint32_t *recirc_id,
 /* Rebalancing. */
 
 static bool
-bond_is_balanced(const struct bond *bond) OVS_REQ_RDLOCK(rwlock)
+bond_is_balanced(const struct bond *bond)
 {
     return bond->rebalance_interval
         && (bond->balance == BM_SLB || bond->balance == BM_TCP)
@@ -1728,7 +1730,6 @@ bond_unixctl_set_active_member(struct unixctl_conn *conn,
     }
 
     if (bond->active_member != member) {
-        bond->bond_revalidate = true;
         bond->active_member = member;
         VLOG_INFO("bond %s: active member is now %s",
                   bond->name, member->name);

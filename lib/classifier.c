@@ -527,6 +527,7 @@ classifier_replace(struct classifier *cls, const struct cls_rule *rule,
     struct cls_match *head;
     unsigned int mask_offset;
     size_t n_rules = 0;
+    uint8_t n_indices;
     uint32_t basis;
     uint32_t hash;
     unsigned int i;
@@ -543,7 +544,8 @@ classifier_replace(struct classifier *cls, const struct cls_rule *rule,
     /* Compute hashes in segments. */
     basis = 0;
     mask_offset = 0;
-    for (i = 0; i < subtable->n_indices; i++) {
+    n_indices = subtable->n_indices;
+    for (i = 0; i < n_indices; i++) {
         ihash[i] = minimatch_hash_range(&rule->match, subtable->index_maps[i],
                                         &mask_offset, &basis);
     }
@@ -575,7 +577,7 @@ classifier_replace(struct classifier *cls, const struct cls_rule *rule,
         }
 
         /* Add new node to segment indices. */
-        for (i = 0; i < subtable->n_indices; i++) {
+        for (i = 0; i < n_indices; i++) {
             ccmap_inc(&subtable->indices[i], ihash[i]);
         }
         n_rules = cmap_insert(&subtable->rules, &new->cmap_node, hash);
@@ -713,6 +715,7 @@ classifier_remove(struct classifier *cls, const struct cls_rule *cls_rule)
     struct cls_subtable *subtable;
     uint32_t basis = 0, hash, ihash[CLS_MAX_INDICES];
     unsigned int mask_offset;
+    uint8_t n_indices;
     size_t n_rules;
     unsigned int i;
 
@@ -730,7 +733,8 @@ classifier_remove(struct classifier *cls, const struct cls_rule *cls_rule)
     ovs_assert(subtable);
 
     mask_offset = 0;
-    for (i = 0; i < subtable->n_indices; i++) {
+    n_indices = subtable->n_indices;
+    for (i = 0; i < n_indices; i++) {
         ihash[i] = minimatch_hash_range(&cls_rule->match,
                                         subtable->index_maps[i],
                                         &mask_offset, &basis);
@@ -783,7 +787,7 @@ classifier_remove(struct classifier *cls, const struct cls_rule *cls_rule)
     }
 
     /* Remove rule node from indices. */
-    for (i = 0; i < subtable->n_indices; i++) {
+    for (i = 0; i < n_indices; i++) {
         ccmap_dec(&subtable->indices[i], ihash[i]);
     }
     n_rules = cmap_remove(&subtable->rules, &rule->cmap_node, hash);
@@ -851,6 +855,32 @@ trie_ctx_init(struct trie_ctx *ctx, const struct cls_trie *trie)
 {
     ctx->trie = trie;
     ctx->lookup_done = false;
+}
+
+static void
+insert_conj_flows(struct hmapx *conj_flows, uint32_t id, int priority,
+                  struct cls_conjunction_set **soft, size_t n_soft)
+{
+    struct cls_conjunction_set *conj_set;
+
+    if (!conj_flows) {
+        return;
+    }
+
+    for (size_t i = 0; i < n_soft; i++) {
+        conj_set = soft[i];
+
+        if (conj_set->priority != priority) {
+            continue;
+        }
+
+        for (size_t j = 0; j < conj_set->n; j++) {
+            if (conj_set->conj[j].id == id) {
+                hmapx_add(conj_flows, (void *) (conj_set->match->cls_rule));
+                break;
+            }
+        }
+    }
 }
 
 struct conjunctive_match {
@@ -933,11 +963,15 @@ free_conjunctive_matches(struct hmap *matches,
  * recursion within this function itself.
  *
  * 'flow' is non-const to allow for temporary modifications during the lookup.
- * Any changes are restored before returning. */
+ * Any changes are restored before returning.
+ *
+ * 'conj_flows' is an optional parameter.  If it is non-null, the matching
+ * conjunctive flows are inserted. */
 static const struct cls_rule *
 classifier_lookup__(const struct classifier *cls, ovs_version_t version,
                     struct flow *flow, struct flow_wildcards *wc,
-                    bool allow_conjunctive_matches)
+                    bool allow_conjunctive_matches,
+                    struct hmapx *conj_flows)
 {
     struct trie_ctx trie_ctx[CLS_MAX_TRIES];
     const struct cls_match *match;
@@ -1097,10 +1131,15 @@ classifier_lookup__(const struct classifier *cls, ovs_version_t version,
                 const struct cls_rule *rule;
 
                 flow->conj_id = id;
-                rule = classifier_lookup__(cls, version, flow, wc, false);
+                rule = classifier_lookup__(cls, version, flow, wc, false,
+                                           NULL);
                 flow->conj_id = saved_conj_id;
 
                 if (rule) {
+                    if (allow_conjunctive_matches) {
+                        insert_conj_flows(conj_flows, id, soft_pri, soft,
+                                          n_soft);
+                    }
                     free_conjunctive_matches(&matches,
                                              cm_stubs, ARRAY_SIZE(cm_stubs));
                     if (soft != soft_stub) {
@@ -1161,12 +1200,16 @@ classifier_lookup__(const struct classifier *cls, ovs_version_t version,
  * flow_wildcards_init_catchall()).
  *
  * 'flow' is non-const to allow for temporary modifications during the lookup.
- * Any changes are restored before returning. */
+ * Any changes are restored before returning.
+ *
+ * 'conj_flows' is an optional parameter.  If it is non-null, the matching
+ * conjunctive flows are inserted. */
 const struct cls_rule *
 classifier_lookup(const struct classifier *cls, ovs_version_t version,
-                  struct flow *flow, struct flow_wildcards *wc)
+                  struct flow *flow, struct flow_wildcards *wc,
+                  struct hmapx *conj_flows)
 {
-    return classifier_lookup__(cls, version, flow, wc, true);
+    return classifier_lookup__(cls, version, flow, wc, true, conj_flows);
 }
 
 /* Finds and returns a rule in 'cls' with exactly the same priority and

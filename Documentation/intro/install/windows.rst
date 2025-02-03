@@ -56,7 +56,7 @@ The following explains the steps in some detail.
 
       'C:/MinGW /mingw'.
 
-- Python 3.6 or later.
+- Python 3.7 or later.
 
   Install the latest Python 3.x from python.org and verify that its path is
   part of Windows' PATH environment variable.
@@ -112,7 +112,7 @@ The following explains the steps in some detail.
   `OpenSSL for Windows <https://wiki.openssl.org/index.php/Binaries>`__
 
   Note down the directory where OpenSSL is installed (e.g.:
-  ``C:/OpenSSL-Win32``) for later use.
+  ``C:/OpenSSL-Win64``) for later use.
 
 .. note::
 
@@ -182,7 +182,7 @@ To configure with SSL support, add the requisite additional options:
        --localstatedir="C:/openvswitch/var"
        --sysconfdir="C:/openvswitch/etc" \
        --with-pthread="C:/pthread" \
-       --enable-ssl --with-openssl="C:/OpenSSL-Win32"
+       --enable-ssl --with-openssl="C:/OpenSSL-Win64"
 
 Finally, to the kernel module also:
 
@@ -194,7 +194,7 @@ Finally, to the kernel module also:
        --localstatedir="C:/openvswitch/var" \
        --sysconfdir="C:/openvswitch/etc" \
        --with-pthread="C:/pthread" \
-       --enable-ssl --with-openssl="C:/OpenSSL-Win32" \
+       --enable-ssl --with-openssl="C:/OpenSSL-Win64" \
        --with-vstudiotarget="<target type>" \
        --with-vstudiotargetver="<target versions>"
 
@@ -703,7 +703,8 @@ Add tunnels
 
 #. IPv4 tunnel, e.g.:
 
-   The Windows Open vSwitch implementation support VXLAN and STT tunnels.
+   The Windows Open vSwitch implementation support VXLAN and STT tunnels
+   (STT tunnel ports are deprecated).
    To add tunnels. For example, first add the tunnel port between
    172.168.201.101 <->172.168.201.102:
 

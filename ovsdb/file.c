@@ -23,6 +23,7 @@
 
 #include "bitmap.h"
 #include "column.h"
+#include "cooperative-multitasking.h"
 #include "log.h"
 #include "openvswitch/json.h"
 #include "lockfile.h"
@@ -80,8 +81,8 @@ ovsdb_file_column_diff_disable(void)
 }
 
 static struct ovsdb_error *
-ovsdb_file_update_row_from_json(struct ovsdb_row *row, bool converting,
-                                bool row_contains_diff,
+ovsdb_file_update_row_from_json(struct ovsdb_row *row, struct ovsdb_row *diff,
+                                bool converting, bool row_contains_diff,
                                 const struct json *json)
 {
     struct ovsdb_table_schema *schema = row->table->schema;
@@ -122,6 +123,12 @@ ovsdb_file_update_row_from_json(struct ovsdb_row *row, bool converting,
             error = ovsdb_datum_apply_diff_in_place(
                                            &row->fields[column->index],
                                            &datum, &column->type);
+            if (!error && diff) {
+                ovs_assert(ovsdb_datum_is_default(&diff->fields[column->index],
+                                                  &column->type));
+                ovsdb_datum_swap(&diff->fields[column->index], &datum);
+            }
+
             ovsdb_datum_destroy(&datum, &column->type);
             if (error) {
                 return error;
@@ -150,16 +157,20 @@ ovsdb_file_txn_row_from_json(struct ovsdb_txn *txn, struct ovsdb_table *table,
         ovsdb_txn_row_delete(txn, row);
         return NULL;
     } else if (row) {
-        return ovsdb_file_update_row_from_json(ovsdb_txn_row_modify(txn, row),
-                                               converting, row_contains_diff,
-                                               json);
+        struct ovsdb_row *new, *diff = NULL;
+
+        ovsdb_txn_row_modify(txn, row, &new,
+                             row_contains_diff ? &diff : NULL);
+        return ovsdb_file_update_row_from_json(new, diff, converting,
+                                               row_contains_diff, json);
     } else {
         struct ovsdb_error *error;
         struct ovsdb_row *new;
 
         new = ovsdb_row_create(table);
         *ovsdb_row_get_uuid_rw(new) = *row_uuid;
-        error = ovsdb_file_update_row_from_json(new, converting, false, json);
+        error = ovsdb_file_update_row_from_json(new, NULL, converting,
+                                                false, json);
         if (error) {
             ovsdb_row_destroy(new);
         } else {
@@ -310,6 +321,8 @@ ovsdb_convert_table(struct ovsdb_txn *txn,
     HMAP_FOR_EACH (src_row, hmap_node, &src_table->rows) {
         struct ovsdb_row *dst_row = ovsdb_row_create(dst_table);
         *ovsdb_row_get_uuid_rw(dst_row) = *ovsdb_row_get_uuid(src_row);
+
+        cooperative_multitasking_yield();
 
         SHASH_FOR_EACH (node, &src_table->schema->columns) {
             const struct ovsdb_column *src_column = node->data;

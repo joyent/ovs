@@ -53,6 +53,7 @@ static bool multi_mask_per_prio = false;
 static bool block_support = false;
 static uint16_t ct_state_support;
 static bool vxlan_gbp_support = false;
+static bool enc_flags_support = false;
 
 struct netlink_field {
     int offset;
@@ -400,12 +401,14 @@ get_next_available_prio(ovs_be16 protocol)
             return TC_RESERVED_PRIORITY_IPV4;
         } else if (protocol == htons(ETH_P_IPV6)) {
             return TC_RESERVED_PRIORITY_IPV6;
+        } else if (protocol == htons(ETH_P_8021Q)) {
+            return TC_RESERVED_PRIORITY_VLAN;
         }
     }
 
     /* last_prio can overflow if there will be many different kinds of
      * flows which shouldn't happen organically. */
-    if (last_prio == UINT16_MAX) {
+    if (last_prio == TC_MAX_PRIORITY) {
         return TC_RESERVED_PRIORITY_NONE;
     }
 
@@ -735,6 +738,36 @@ flower_tun_opt_to_match(struct match *match, struct tc_flower *flower)
 }
 
 static void
+flower_tun_enc_flags_to_match(struct match *match, struct tc_flower *flower)
+{
+    uint32_t tc_flags = flower->key.tunnel.tc_enc_flags;
+    uint32_t tc_mask = flower->mask.tunnel.tc_enc_flags;
+    uint16_t *m_flags = &match->flow.tunnel.flags;
+    uint16_t *m_mask = &match->wc.masks.tunnel.flags;
+
+    if (tc_mask & TCA_FLOWER_KEY_FLAGS_TUNNEL_OAM) {
+        if (tc_flags & TCA_FLOWER_KEY_FLAGS_TUNNEL_OAM) {
+            *m_flags |= FLOW_TNL_F_OAM;
+        }
+        *m_mask |= FLOW_TNL_F_OAM;
+    }
+
+    if (tc_mask & TCA_FLOWER_KEY_FLAGS_TUNNEL_DONT_FRAGMENT) {
+        if (tc_flags & TCA_FLOWER_KEY_FLAGS_TUNNEL_DONT_FRAGMENT) {
+            *m_flags |= FLOW_TNL_F_DONT_FRAGMENT;
+        }
+        *m_mask |= FLOW_TNL_F_DONT_FRAGMENT;
+    }
+
+    if (tc_mask & TCA_FLOWER_KEY_FLAGS_TUNNEL_CSUM) {
+        if (tc_flags & TCA_FLOWER_KEY_FLAGS_TUNNEL_CSUM) {
+            *m_flags |= FLOW_TNL_F_CSUM;
+        }
+        *m_mask |= FLOW_TNL_F_CSUM;
+    }
+}
+
+static void
 parse_tc_flower_to_stats(struct tc_flower *flower,
                          struct dpif_flow_stats *stats)
 {
@@ -885,6 +918,9 @@ parse_tc_flower_to_actions__(struct tc_flower *flower, struct ofpbuf *buf,
             }
             if (!action->encap.no_csum) {
                 nl_msg_put_flag(buf, OVS_TUNNEL_KEY_ATTR_CSUM);
+            }
+            if (action->encap.dont_fragment) {
+                nl_msg_put_flag(buf, OVS_TUNNEL_KEY_ATTR_DONT_FRAGMENT);
             }
             ret = parse_tc_flower_vxlan_tun_opts(action, buf);
             if (ret) {
@@ -1269,6 +1305,9 @@ parse_tc_flower_to_match(const struct netdev *netdev,
                                            flower->key.tunnel.gbp.flags,
                                            flower->mask.tunnel.gbp.flags);
         }
+        if (flower->mask.tunnel.tc_enc_flags) {
+            flower_tun_enc_flags_to_match(match, flower);
+        }
 
         if (!strcmp(netdev_get_type(netdev), "geneve")) {
             flower_tun_opt_to_match(match, flower);
@@ -1488,6 +1527,31 @@ parse_put_flow_ct_action(struct tc_flower *flower,
         return 0;
 }
 
+/* This function returns true if the tc layer will add a l4 checksum action
+ * for this set action.  Refer to the csum_update_flag() function for
+ * detailed logic.  Note that even the kernel only supports updating TCP,
+ * UDP and ICMPv6.
+ */
+static bool
+tc_will_add_l4_checksum(struct tc_flower *flower, int type)
+{
+    switch (type) {
+    case OVS_KEY_ATTR_IPV4:
+    case OVS_KEY_ATTR_IPV6:
+    case OVS_KEY_ATTR_TCP:
+    case OVS_KEY_ATTR_UDP:
+        switch (flower->key.ip_proto) {
+        case IPPROTO_TCP:
+        case IPPROTO_UDP:
+        case IPPROTO_ICMPV6:
+        case IPPROTO_UDPLITE:
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
 static int
 parse_put_flow_set_masked_action(struct tc_flower *flower,
                                  struct tc_action *action,
@@ -1516,6 +1580,14 @@ parse_put_flow_set_masked_action(struct tc_flower *flower,
     if (type >= ARRAY_SIZE(set_flower_map)
         || !set_flower_map[type][0].size) {
         VLOG_DBG_RL(&rl, "unsupported set action type: %d", type);
+        ofpbuf_uninit(&set_buf);
+        return EOPNOTSUPP;
+    }
+
+    if (flower->key.flags & TCA_FLOWER_KEY_FLAGS_IS_FRAGMENT
+        && tc_will_add_l4_checksum(flower, type)) {
+        VLOG_DBG_RL(&rl, "set action type %d not supported on fragments "
+                    "due to checksum limitation", type);
         ofpbuf_uninit(&set_buf);
         return EOPNOTSUPP;
     }
@@ -1605,11 +1677,14 @@ parse_put_flow_set_action(struct tc_flower *flower, struct tc_action *action,
         }
         break;
         case OVS_TUNNEL_KEY_ATTR_DONT_FRAGMENT: {
-            /* XXX: This is wrong!  We're ignoring the DF flag configuration
-             * requested by the user.  However, TC for now has no way to pass
-             * that flag and it is set by default, meaning tunnel offloading
-             * will not work if 'options:df_default=false' is not set.
-             * Keeping incorrect behavior for now. */
+            if (enc_flags_support) {
+                action->encap.dont_fragment = true;
+            } else {
+                /* For kernels not supporting the DF flag, we ignoring the
+                 * configuration requested by the user.  This to keep the old,
+                 * incorrect behaviour, and allow tunnels to be offloaded by
+                 * TC with these kernels. */
+            }
         }
         break;
         case OVS_TUNNEL_KEY_ATTR_CSUM: {
@@ -1627,7 +1702,9 @@ parse_put_flow_set_action(struct tc_flower *flower, struct tc_action *action,
         }
         break;
         case OVS_TUNNEL_KEY_ATTR_TP_SRC: {
-            action->encap.tp_src = nl_attr_get_be16(tun_attr);
+            /* There is no corresponding attribute in TC. */
+            VLOG_DBG_RL(&rl, "unsupported tunnel key attribute TP_SRC");
+            return EOPNOTSUPP;
         }
         break;
         case OVS_TUNNEL_KEY_ATTR_TP_DST: {
@@ -1783,12 +1860,12 @@ test_key_and_mask(struct match *match)
     return 0;
 }
 
-static void
+static int
 flower_match_to_tun_opt(struct tc_flower *flower, const struct flow_tnl *tnl,
                         struct flow_tnl *tnl_mask)
 {
     struct geneve_opt *opt, *opt_mask;
-    int len, cnt = 0;
+    int tot_opt_len, len, cnt = 0;
 
     /* 'flower' always has an exact match on tunnel metadata length, so having
      * it in a wrong format is not acceptable unless it is empty. */
@@ -1804,7 +1881,7 @@ flower_match_to_tun_opt(struct tc_flower *flower, const struct flow_tnl *tnl,
             memset(&tnl_mask->metadata.present.map, 0,
                    sizeof tnl_mask->metadata.present.map);
         }
-        return;
+        return 0;
     }
 
     tnl_mask->flags &= ~FLOW_TNL_F_UDPIF;
@@ -1818,7 +1895,7 @@ flower_match_to_tun_opt(struct tc_flower *flower, const struct flow_tnl *tnl,
            sizeof tnl_mask->metadata.present.len);
 
     if (!tnl->metadata.present.len) {
-        return;
+        return 0;
     }
 
     memcpy(flower->key.tunnel.metadata.opts.gnv, tnl->metadata.opts.gnv,
@@ -1832,7 +1909,16 @@ flower_match_to_tun_opt(struct tc_flower *flower, const struct flow_tnl *tnl,
      * also not masks, but actual lengths in the 'flower' structure. */
     len = flower->key.tunnel.metadata.present.len;
     while (len) {
+        if (len < sizeof *opt) {
+            return EOPNOTSUPP;
+        }
+
         opt = &flower->key.tunnel.metadata.opts.gnv[cnt];
+        tot_opt_len = sizeof *opt + opt->length * 4;
+        if (len < tot_opt_len) {
+            return EOPNOTSUPP;
+        }
+
         opt_mask = &flower->mask.tunnel.metadata.opts.gnv[cnt];
 
         opt_mask->length = opt->length;
@@ -1840,6 +1926,8 @@ flower_match_to_tun_opt(struct tc_flower *flower, const struct flow_tnl *tnl,
         cnt += sizeof(struct geneve_opt) / 4 + opt->length;
         len -= sizeof(struct geneve_opt) + opt->length * 4;
     }
+
+    return 0;
 }
 
 static void
@@ -2205,6 +2293,7 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
     const struct flow_tnl *tnl = &match->flow.tunnel;
     struct flow_tnl *tnl_mask = &mask->tunnel;
     struct dpif_flow_stats adjust_stats;
+    bool exact_match_on_dl_type;
     bool recirc_act = false;
     uint32_t block_id = 0;
     struct tcf_id id;
@@ -2222,6 +2311,7 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
 
     memset(&flower, 0, sizeof flower);
 
+    exact_match_on_dl_type = mask->dl_type == htons(0xffff);
     chain = key->recirc_id;
     mask->recirc_id = 0;
 
@@ -2277,15 +2367,48 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
         memset(&tnl_mask->gbp_flags, 0, sizeof tnl_mask->gbp_flags);
         tnl_mask->flags &= ~FLOW_TNL_F_KEY;
 
-        /* XXX: This is wrong!  We're ignoring DF and CSUM flags configuration
-         * requested by the user.  However, TC for now has no way to pass
-         * these flags in a flower key and their masks are set by default,
-         * meaning tunnel offloading will not work at all if not cleared.
-         * Keeping incorrect behavior for now. */
-        tnl_mask->flags &= ~(FLOW_TNL_F_DONT_FRAGMENT | FLOW_TNL_F_CSUM);
+        if (enc_flags_support) {
+            if (tnl_mask->flags & FLOW_TNL_F_OAM) {
+                if (tnl->flags & FLOW_TNL_F_OAM) {
+                    flower.key.tunnel.tc_enc_flags |=
+                        TCA_FLOWER_KEY_FLAGS_TUNNEL_OAM;
+                }
+                flower.mask.tunnel.tc_enc_flags |=
+                    TCA_FLOWER_KEY_FLAGS_TUNNEL_OAM;
+                tnl_mask->flags &= ~FLOW_TNL_F_OAM;
+            }
+            if (tnl_mask->flags & FLOW_TNL_F_DONT_FRAGMENT) {
+                if (tnl->flags & FLOW_TNL_F_DONT_FRAGMENT) {
+                    flower.key.tunnel.tc_enc_flags |=
+                        TCA_FLOWER_KEY_FLAGS_TUNNEL_DONT_FRAGMENT;
+                }
+                flower.mask.tunnel.tc_enc_flags |=
+                    TCA_FLOWER_KEY_FLAGS_TUNNEL_DONT_FRAGMENT;
+                tnl_mask->flags &= ~FLOW_TNL_F_DONT_FRAGMENT;
+            }
+            if (tnl_mask->flags & FLOW_TNL_F_CSUM) {
+                if (tnl->flags & FLOW_TNL_F_CSUM) {
+                    flower.key.tunnel.tc_enc_flags |=
+                        TCA_FLOWER_KEY_FLAGS_TUNNEL_CSUM;
+                }
+                flower.mask.tunnel.tc_enc_flags |=
+                    TCA_FLOWER_KEY_FLAGS_TUNNEL_CSUM;
+                tnl_mask->flags &= ~FLOW_TNL_F_CSUM;
+            }
+        } else {
+            /* For kernels not supporting the encapsulation flags we're
+             * ignoring DF and CSUM flags configuration requested by the user.
+             * This to keep the old, incorrect behaviour, and allow tunnels to
+             * be offloaded by TC with these kernels. */
+            tnl_mask->flags &= ~(FLOW_TNL_F_DONT_FRAGMENT | FLOW_TNL_F_CSUM);
+        }
 
         if (!strcmp(netdev_get_type(netdev), "geneve")) {
-            flower_match_to_tun_opt(&flower, tnl, tnl_mask);
+            err = flower_match_to_tun_opt(&flower, tnl, tnl_mask);
+            if (err) {
+                VLOG_WARN_RL(&warn_rl, "Unable to parse geneve options");
+                return err;
+            }
         }
         flower.tunnel = true;
     } else {
@@ -2382,7 +2505,7 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
     mask->dl_type = 0;
     mask->in_port.odp_port = 0;
 
-    if (key->dl_type == htons(ETH_P_ARP)) {
+    if (exact_match_on_dl_type && key->dl_type == htons(ETH_P_ARP)) {
             flower.key.arp.spa = key->nw_src;
             flower.key.arp.tpa = key->nw_dst;
             flower.key.arp.sha = key->arp_sha;
@@ -2401,7 +2524,8 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
             memset(&mask->arp_tha, 0, sizeof mask->arp_tha);
     }
 
-    if (is_ip_any(key) && !is_ipv6_fragment_and_masked(key, mask)) {
+    if (exact_match_on_dl_type && is_ip_any(key)
+        && !is_ipv6_fragment_and_masked(key, mask)) {
         flower.key.ip_proto = key->nw_proto;
         flower.mask.ip_proto = mask->nw_proto;
         mask->nw_proto = 0;
@@ -2428,6 +2552,12 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
             }
 
             mask->nw_frag = 0;
+        } else {
+            /* This scenario should not occur.  Currently, all installed IP DP
+             * flows perform a fully masked match on the fragmentation bits.
+             * However, since TC depends on this behavior, we return EOPNOTSUPP
+             * for now in case this behavior changes in the future. */
+            return EOPNOTSUPP;
         }
 
         if (key->nw_proto == IPPROTO_TCP) {
@@ -2844,6 +2974,49 @@ out:
     tc_add_del_qdisc(ifindex, false, block_id, TC_INGRESS);
 }
 
+static void
+probe_enc_flags_support(int ifindex)
+{
+    struct tc_flower flower;
+    struct tcf_id id;
+    int block_id = 0;
+    int prio = TC_RESERVED_PRIORITY_FEATURE_PROBE;
+    int error;
+
+    error = tc_add_del_qdisc(ifindex, true, block_id, TC_INGRESS);
+    if (error) {
+        return;
+    }
+
+    memset(&flower, 0, sizeof flower);
+    flower.tc_policy = TC_POLICY_SKIP_HW;
+    flower.key.eth_type = htons(ETH_P_IP);
+    flower.mask.eth_type = OVS_BE16_MAX;
+    flower.tunnel = true;
+    flower.mask.tunnel.id = OVS_BE64_MAX;
+    flower.mask.tunnel.ipv4.ipv4_src = OVS_BE32_MAX;
+    flower.mask.tunnel.ipv4.ipv4_dst = OVS_BE32_MAX;
+    flower.mask.tunnel.tp_dst = OVS_BE16_MAX;
+    flower.mask.tunnel.tc_enc_flags = TCA_FLOWER_KEY_FLAGS_TUNNEL_CRIT_OPT;
+    flower.key.tunnel.ipv4.ipv4_src = htonl(0x01010101);
+    flower.key.tunnel.ipv4.ipv4_dst = htonl(0x01010102);
+    flower.key.tunnel.tp_dst = htons(46354);
+    flower.key.tunnel.tc_enc_flags = TCA_FLOWER_KEY_FLAGS_TUNNEL_CRIT_OPT;
+
+    id = tc_make_tcf_id(ifindex, block_id, prio, TC_INGRESS);
+    error = tc_replace_flower(&id, &flower);
+    if (error) {
+        goto out;
+    }
+
+    tc_del_flower_filter(&id);
+
+    enc_flags_support = true;
+    VLOG_INFO("probe tc: enc flags are supported.");
+out:
+    tc_add_del_qdisc(ifindex, false, block_id, TC_INGRESS);
+}
+
 static int
 tc_get_policer_action_ids(struct hmap *map)
 {
@@ -2972,6 +3145,7 @@ netdev_tc_init_flow_api(struct netdev *netdev)
         probe_multi_mask_per_prio(ifindex);
         probe_ct_state_support(ifindex);
         probe_vxlan_gbp_support(ifindex);
+        probe_enc_flags_support(ifindex);
 
         ovs_mutex_lock(&meter_police_ids_mutex);
         meter_police_ids = id_pool_create(METER_POLICE_IDS_BASE,

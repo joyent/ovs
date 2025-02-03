@@ -30,7 +30,7 @@ from ovs.flow.ofp_act import (
     decode_move_field,
     decode_dec_ttl,
     decode_chk_pkt_larger,
-    decode_zone,
+    decode_field_or_int,
     decode_learn,
 )
 
@@ -170,12 +170,13 @@ class OFPFlow(Flow):
         args = {
             "table": decode_int,
             "duration": decode_time,
-            "n_packet": decode_int,
+            "n_packets": decode_int,
             "n_bytes": decode_int,
             "cookie": decode_int,
             "idle_timeout": decode_time,
             "hard_timeout": decode_time,
             "hard_age": decode_time,
+            "idle_age": decode_time,
         }
         return KVDecoders(args)
 
@@ -329,7 +330,7 @@ class OFPFlow(Flow):
                 KVDecoders(
                     {
                         "commit": decode_flag,
-                        "zone": decode_zone,
+                        "zone": decode_field_or_int,
                         "table": decode_int,
                         "nat": decode_nat,
                         "force": decode_flag,
@@ -425,8 +426,8 @@ class OFPFlow(Flow):
                     {
                         "probability": decode_int,
                         "collector_set_id": decode_int,
-                        "obs_domain_id": decode_int,
-                        "obs_point_id": decode_int,
+                        "obs_domain_id": decode_field_or_int,
+                        "obs_point_id": decode_field_or_int,
                         "sampling_port": decode_default,
                         "ingress": decode_flag,
                         "egress": decode_flag,

@@ -1,4 +1,5 @@
-/* Copyright (c) 2015 Nicira, Inc.
+/*
+ * Copyright (c) 2023 Red Hat, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,13 +14,10 @@
  * limitations under the License.
  */
 
-#ifndef __CHECKER__
-#error "Use this header only with sparse.  It is not a correct implementation."
-#endif
+#ifndef DP_PACKET_GSO_H
+#define DP_PACKET_GSO_H 1
 
-/* Fix sparse technicality about types in one of the function calls by just
- * ignoring it. */
-#define __sync_add_and_fetch(a, b) (0)
+bool dp_packet_gso(struct dp_packet *, struct dp_packet_batch **);
+int dp_packet_gso_nr_segs(struct dp_packet *);
 
-/* Get actual <rte_atomic.h> definitions for us to annotate and build on. */
-#include_next <rte_atomic.h>
+#endif /* dp-packet-gso.h */

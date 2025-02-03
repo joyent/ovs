@@ -620,7 +620,7 @@ class PassiveStream(object):
             raise Exception('Unknown connection string')
 
         try:
-            sock.listen(10)
+            sock.listen(64)
         except socket.error as e:
             vlog.err("%s: listen: %s" % (name, os.strerror(e.error)))
             sock.close()
@@ -728,7 +728,7 @@ def usage(name):
 Active %s connection methods:
   unix:FILE               Unix domain socket named FILE
   tcp:HOST:PORT           TCP socket to HOST with port no of PORT
-  ssl:HOST:PORT           SSL socket to HOST with port no of PORT
+  ssl:HOST:PORT           SSL/TLS socket to HOST with port no of PORT
 
 Passive %s connection methods:
   punix:FILE              Listen on Unix domain socket FILE""" % (name, name)
@@ -790,12 +790,14 @@ class SSLStream(Stream):
         if sock is None:
             return family, sock
 
-        # Create an SSL context
-        ctx = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        # Create an SSL context.
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.verify_mode = ssl.CERT_REQUIRED
-        ctx.options |= ssl.OP_NO_SSLv2
-        ctx.options |= ssl.OP_NO_SSLv3
-        # If the client has not set the SSL configuration files
+        ctx.check_hostname = False
+        # Only allow TLSv1.2 or later.
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.maximum_version = ssl.TLSVersion.MAXIMUM_SUPPORTED
+        # If the client has not set the SSL/TLS configuration files
         # exception would be raised.
         ctx.load_verify_locations(Stream._SSL_ca_cert_file)
         ctx.load_cert_chain(Stream._SSL_certificate_file,
@@ -819,7 +821,7 @@ class SSLStream(Stream):
         if retval:
             return retval
 
-        # TCP Connection is successful. Now do the SSL handshake
+        # TCP Connection is successful. Now do the SSL/TLS handshake.
         try:
             self.socket.do_handshake()
         except ssl.SSLWantReadError:
@@ -862,5 +864,5 @@ class SSLStream(Stream):
 
 
 if ssl:
-    # Register SSL only if the OpenSSL module is available
+    # Register SSL/TLS only if the OpenSSL module is available.
     Stream.register_method("ssl", SSLStream)

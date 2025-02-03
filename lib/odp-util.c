@@ -143,7 +143,9 @@ odp_action_len(uint16_t type)
     case OVS_ACTION_ATTR_POP_NSH: return 0;
     case OVS_ACTION_ATTR_CHECK_PKT_LEN: return ATTR_LEN_VARIABLE;
     case OVS_ACTION_ATTR_ADD_MPLS: return sizeof(struct ovs_action_add_mpls);
+    case OVS_ACTION_ATTR_DEC_TTL: return ATTR_LEN_VARIABLE;
     case OVS_ACTION_ATTR_DROP: return sizeof(uint32_t);
+    case OVS_ACTION_ATTR_PSAMPLE: return ATTR_LEN_VARIABLE;
 
     case OVS_ACTION_ATTR_UNSPEC:
     case __OVS_ACTION_ATTR_MAX:
@@ -1054,7 +1056,7 @@ format_odp_set_nsh(struct ds *ds, const struct nlattr *attr)
         enum ovs_nsh_key_attr type = nl_attr_type(a);
         size_t len = nl_attr_get_size(a);
 
-        if (type >= OVS_NSH_KEY_ATTR_MAX) {
+        if (type > OVS_NSH_KEY_ATTR_MAX) {
             return;
         }
 
@@ -1128,6 +1130,47 @@ format_odp_check_pkt_len_action(struct ds *ds, const struct nlattr *attr,
     format_odp_actions(ds, nl_attr_get(acts), nl_attr_get_size(acts),
                            portno_names);
     ds_put_cstr(ds, "))");
+}
+
+static void
+format_dec_ttl_action(struct ds *ds, const struct nlattr *attr,
+                      const struct hmap *portno_names)
+{
+    const struct nlattr *a;
+    unsigned int left;
+
+    ds_put_cstr(ds,"dec_ttl(le_1(");
+    NL_ATTR_FOR_EACH (a, left,
+                      nl_attr_get(attr), nl_attr_get_size(attr)) {
+        if (nl_attr_type(a) == OVS_DEC_TTL_ATTR_ACTION) {
+           format_odp_actions(ds, nl_attr_get(a),
+                              nl_attr_get_size(a), portno_names);
+           break;
+        }
+    }
+    ds_put_format(ds, "))");
+}
+
+static void
+format_odp_psample_action(struct ds *ds, const struct nlattr *attr)
+{
+    const struct nlattr *a;
+    unsigned int left;
+
+    ds_put_cstr(ds, "psample(");
+    NL_NESTED_FOR_EACH (a, left, attr) {
+        switch (a->nla_type) {
+        case OVS_PSAMPLE_ATTR_GROUP:
+            ds_put_format(ds, "group=%"PRIu32",", nl_attr_get_u32(a));
+            break;
+        case OVS_PSAMPLE_ATTR_COOKIE:
+            ds_put_cstr(ds, "cookie=");
+            ds_put_hex(ds, nl_attr_get(a), nl_attr_get_size(a));
+            break;
+        }
+    }
+    ds_chomp(ds, ',');
+    ds_put_char(ds, ')');
 }
 
 static void
@@ -1283,8 +1326,14 @@ format_odp_action(struct ds *ds, const struct nlattr *a,
                       ntohs(mpls->mpls_ethertype));
         break;
     }
+    case OVS_ACTION_ATTR_DEC_TTL:
+        format_dec_ttl_action(ds, a, portno_names);
+        break;
     case OVS_ACTION_ATTR_DROP:
         ds_put_cstr(ds, "drop");
+        break;
+    case OVS_ACTION_ATTR_PSAMPLE:
+        format_odp_psample_action(ds, a);
         break;
     case OVS_ACTION_ATTR_UNSPEC:
     case __OVS_ACTION_ATTR_MAX:
@@ -1797,8 +1846,8 @@ ovs_parse_tnl_push(const char *s, struct ovs_action_push_tnl *data)
     } else if (ovs_scan_len(s, &n, "srv6(segments_left=%"SCNu8,
                             &segments_left)) {
         struct srv6_base_hdr *srh = (struct srv6_base_hdr *) (ip6 + 1);
+        union ovs_16aligned_in6_addr *segs;
         char seg_s[IPV6_SCAN_LEN + 1];
-        struct in6_addr *segs;
         struct in6_addr seg;
         uint8_t n_segs = 0;
 
@@ -1821,7 +1870,7 @@ ovs_parse_tnl_push(const char *s, struct ovs_action_push_tnl *data)
             return -EINVAL;
         }
 
-        segs = ALIGNED_CAST(struct in6_addr *, srh + 1);
+        segs = (union ovs_16aligned_in6_addr *) (srh + 1);
         segs += segments_left;
 
         while (ovs_scan_len(s, &n, IPV6_SCAN_FMT, seg_s)
@@ -2336,6 +2385,50 @@ out:
 }
 
 static int
+parse_odp_psample_action(const char *s, struct ofpbuf *actions)
+{
+    char buf[2 * OVS_PSAMPLE_COOKIE_MAX_SIZE + 1];
+    uint8_t cookie[OVS_PSAMPLE_COOKIE_MAX_SIZE];
+    bool has_group = false;
+    size_t cookie_len = 0;
+    uint32_t group;
+    int n = 0;
+
+    if (!ovs_scan_len(s, &n, "psample(")) {
+        return -EINVAL;
+    }
+
+    while (s[n] != ')') {
+        n += strspn(s + n, delimiters);
+
+        if (!has_group && ovs_scan_len(s, &n, "group=%"SCNi32, &group)) {
+            has_group = true;
+            continue;
+        }
+
+        if (!cookie_len &&
+            ovs_scan_len(s, &n, "cookie=0x%32[0-9a-fA-F]", buf) && n > 7) {
+            struct ofpbuf b;
+
+            ofpbuf_use_stub(&b, cookie, OVS_PSAMPLE_COOKIE_MAX_SIZE);
+            ofpbuf_put_hex(&b, buf, &cookie_len);
+            ofpbuf_uninit(&b);
+            continue;
+        }
+        return -EINVAL;
+    }
+    n++;
+
+    if (!has_group) {
+        return -EINVAL;
+    }
+
+    odp_put_psample_action(actions, group, cookie_len ? cookie : NULL,
+                           cookie_len);
+    return n;
+}
+
+static int
 parse_action_list(struct parse_odp_context *context, const char *s,
                   struct ofpbuf *actions)
 {
@@ -2694,6 +2787,10 @@ parse_odp_action__(struct parse_odp_context *context, const char *s,
                               &mpls, sizeof mpls);
             return n;
         }
+    }
+
+    if (!strncmp(s, "psample(", 8)) {
+        return parse_odp_psample_action(s, actions);
     }
 
     {
@@ -4172,7 +4269,7 @@ mask_empty(const struct nlattr *ma)
 static void
 format_odp_key_attr__(const struct nlattr *a, const struct nlattr *ma,
                       const struct hmap *portno_names, struct ds *ds,
-                      bool verbose)
+                      bool verbose, bool skip_no_mask)
 {
     enum ovs_key_attr attr = nl_attr_type(a);
     char namebuf[OVS_KEY_ATTR_BUFSIZE];
@@ -4188,10 +4285,10 @@ format_odp_key_attr__(const struct nlattr *a, const struct nlattr *ma,
         if (ma && nl_attr_get_size(ma) && nl_attr_get_size(a)) {
             odp_flow_format(nl_attr_get(a), nl_attr_get_size(a),
                             nl_attr_get(ma), nl_attr_get_size(ma), NULL, ds,
-                            verbose);
+                            verbose, skip_no_mask);
         } else if (nl_attr_get_size(a)) {
             odp_flow_format(nl_attr_get(a), nl_attr_get_size(a), NULL, 0, NULL,
-                            ds, verbose);
+                            ds, verbose, skip_no_mask);
         }
         break;
 
@@ -4499,7 +4596,7 @@ format_odp_key_attr(const struct nlattr *a, const struct nlattr *ma,
 {
     if (check_attr_len(ds, a, ma, ovs_flow_key_attr_lens,
                         OVS_KEY_ATTR_MAX, false)) {
-        format_odp_key_attr__(a, ma, portno_names, ds, verbose);
+        format_odp_key_attr__(a, ma, portno_names, ds, verbose, false);
     }
 }
 
@@ -4613,13 +4710,16 @@ odp_format_ufid(const ovs_u128 *ufid, struct ds *ds)
 }
 
 /* Appends to 'ds' a string representation of the 'key_len' bytes of
- * OVS_KEY_ATTR_* attributes in 'key'. If non-null, additionally formats the
- * 'mask_len' bytes of 'mask' which apply to 'key'. If 'portno_names' is
- * non-null, translates odp port number to its name. */
+ * OVS_KEY_ATTR_* attributes in 'key'.  If non-null, additionally formats the
+ * 'mask_len' bytes of 'mask' which apply to 'key'.  If 'portno_names' is
+ * non-null, translates odp port number to its name.  If 'skip_no_mask' is set
+ * to true, OVS_KEY_ATTR_* entries without a mask will not be printed, even
+ * when verbose mode is 'true'. */
 void
 odp_flow_format(const struct nlattr *key, size_t key_len,
                 const struct nlattr *mask, size_t mask_len,
-                const struct hmap *portno_names, struct ds *ds, bool verbose)
+                const struct hmap *portno_names, struct ds *ds, bool verbose,
+                bool skip_no_mask)
 {
     if (key_len) {
         const struct nlattr *a;
@@ -4637,7 +4737,8 @@ odp_flow_format(const struct nlattr *key, size_t key_len,
                                                         attr_type)
                                        : NULL);
             if (!check_attr_len(ds, a, ma, ovs_flow_key_attr_lens,
-                                OVS_KEY_ATTR_MAX, false)) {
+                                OVS_KEY_ATTR_MAX, false)
+                || (skip_no_mask && !ma)) {
                 continue;
             }
 
@@ -4668,7 +4769,8 @@ odp_flow_format(const struct nlattr *key, size_t key_len,
                 if (!first_field) {
                     ds_put_char(ds, ',');
                 }
-                format_odp_key_attr__(a, ma, portno_names, ds, verbose);
+                format_odp_key_attr__(a, ma, portno_names, ds, verbose,
+                                      skip_no_mask);
                 first_field = false;
             } else if (attr_type == OVS_KEY_ATTR_ETHERNET
                        && !has_packet_type_key) {
@@ -4739,7 +4841,7 @@ void
 odp_flow_key_format(const struct nlattr *key,
                     size_t key_len, struct ds *ds)
 {
-    odp_flow_format(key, key_len, NULL, 0, NULL, ds, true);
+    odp_flow_format(key, key_len, NULL, 0, NULL, ds, true, false);
 }
 
 static bool
@@ -6464,12 +6566,10 @@ odp_flow_key_from_flow__(const struct odp_flow_key_parms *parms,
             icmpv6_key->icmpv6_code = ntohs(data->tp_dst);
 
             if (is_nd(flow, NULL)
-                /* Even though 'tp_src' and 'tp_dst' are 16 bits wide, ICMP
-                 * type and code are 8 bits wide.  Therefore, an exact match
-                 * looks like htons(0xff), not htons(0xffff).  See
-                 * xlate_wc_finish() for details. */
-                && (!export_mask || (data->tp_src == htons(0xff)
-                                     && data->tp_dst == htons(0xff)))) {
+                /* Even though 'tp_src' is 16 bits wide, ICMP type is 8 bits
+                 * wide.  Therefore, an exact match looks like htons(0xff),
+                 * not htons(0xffff).  See xlate_wc_finish() for details. */
+                && (!export_mask || data->tp_src == htons(0xff))) {
                 struct ovs_key_nd *nd_key;
                 nd_key = nl_msg_put_unspec_uninit(buf, OVS_KEY_ATTR_ND,
                                                     sizeof *nd_key);
@@ -7185,20 +7285,17 @@ parse_l2_5_onward(const struct nlattr *attrs[OVS_KEY_ATTR_MAX + 1],
                     flow->arp_sha = nd_key->nd_sll;
                     flow->arp_tha = nd_key->nd_tll;
                     if (is_mask) {
-                        /* Even though 'tp_src' and 'tp_dst' are 16 bits wide,
-                         * ICMP type and code are 8 bits wide.  Therefore, an
-                         * exact match looks like htons(0xff), not
-                         * htons(0xffff).  See xlate_wc_finish() for details.
-                         * */
+                        /* Even though 'tp_src' is 16 bits wide, ICMP type
+                         * is 8 bits wide.  Therefore, an exact match looks
+                         * like htons(0xff), not htons(0xffff).  See
+                         * xlate_wc_finish() for details. */
                         if (!is_all_zeros(nd_key, sizeof *nd_key) &&
-                            (flow->tp_src != htons(0xff) ||
-                             flow->tp_dst != htons(0xff))) {
+                            flow->tp_src != htons(0xff)) {
                             odp_parse_error(&rl, errorp,
-                                            "ICMP (src,dst) masks should be "
-                                            "(0xff,0xff) but are actually "
-                                            "(%#"PRIx16",%#"PRIx16")",
-                                            ntohs(flow->tp_src),
-                                            ntohs(flow->tp_dst));
+                                            "ICMP src mask should be "
+                                            "(0xff) but is actually "
+                                            "(%#"PRIx16")",
+                                            ntohs(flow->tp_src));
                             return ODP_FIT_ERROR;
                         } else {
                             *expected_attrs |= UINT64_C(1) << OVS_KEY_ATTR_ND;
@@ -7655,7 +7752,7 @@ parse_key_and_mask_to_match(const struct nlattr *key, size_t key_len,
             struct ds s;
 
             ds_init(&s);
-            odp_flow_format(key, key_len, NULL, 0, NULL, &s, true);
+            odp_flow_format(key, key_len, NULL, 0, NULL, &s, true, false);
             VLOG_ERR("internal error parsing flow key %s (%s)",
                      ds_cstr(&s), odp_key_fitness_to_string(fitness));
             ds_destroy(&s);
@@ -7675,7 +7772,7 @@ parse_key_and_mask_to_match(const struct nlattr *key, size_t key_len,
 
             ds_init(&s);
             odp_flow_format(key, key_len, mask, mask_len, NULL, &s,
-                            true);
+                            true, true);
             VLOG_ERR("internal error parsing flow mask %s (%s)",
                      ds_cstr(&s), odp_key_fitness_to_string(fitness));
             ds_destroy(&s);
@@ -7808,6 +7905,23 @@ odp_put_tnl_push_action(struct ofpbuf *odp_actions,
 
     size += data->header_len;
     nl_msg_put_unspec(odp_actions, OVS_ACTION_ATTR_TUNNEL_PUSH, data, size);
+}
+
+void
+odp_put_psample_action(struct ofpbuf *odp_actions, uint32_t group_id,
+                       uint8_t *cookie, size_t cookie_len)
+{
+    size_t offset = nl_msg_start_nested_with_flag(odp_actions,
+                                                  OVS_ACTION_ATTR_PSAMPLE);
+
+    nl_msg_put_u32(odp_actions, OVS_PSAMPLE_ATTR_GROUP, group_id);
+    if (cookie && cookie_len) {
+        ovs_assert(cookie_len <= OVS_PSAMPLE_COOKIE_MAX_SIZE);
+        nl_msg_put_unspec(odp_actions, OVS_PSAMPLE_ATTR_COOKIE, cookie,
+                          cookie_len);
+    }
+
+    nl_msg_end_nested(odp_actions, offset);
 }
 
 

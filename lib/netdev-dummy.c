@@ -39,11 +39,13 @@
 #include "pcap-file.h"
 #include "openvswitch/poll-loop.h"
 #include "openvswitch/shash.h"
+#include "ovs-router.h"
 #include "sset.h"
 #include "stream.h"
 #include "unaligned.h"
 #include "timeval.h"
 #include "unixctl.h"
+#include "userspace-tso.h"
 #include "reconnect.h"
 
 VLOG_DEFINE_THIS_MODULE(netdev_dummy);
@@ -152,6 +154,8 @@ struct netdev_dummy {
     bool ol_ip_csum OVS_GUARDED;
     /* Flag RX packet with good csum. */
     bool ol_ip_csum_set_good OVS_GUARDED;
+    /* Set the segment size for netdev TSO support. */
+    int ol_tso_segsz OVS_GUARDED;
 };
 
 /* Max 'recv_queue_len' in struct netdev_dummy. */
@@ -795,14 +799,29 @@ netdev_dummy_get_config(const struct netdev *dev, struct smap *args)
 
     dummy_packet_conn_get_config(&netdev->conn, args);
 
+    /* pcap, rxq_pcap and tx_pcap cannot be recovered because filenames have
+     * been discarded after opening file descriptors */
+
+    if (netdev->ol_ip_csum) {
+        smap_add_format(args, "ol_ip_csum", "%s", "true");
+    }
+
+    if (netdev->ol_ip_csum_set_good) {
+        smap_add_format(args, "ol_ip_csum_set_good", "%s", "true");
+    }
+
+    if (netdev->ol_tso_segsz && userspace_tso_enabled()) {
+        smap_add_format(args, "ol_tso_segsz", "%d", netdev->ol_tso_segsz);
+    }
+
     /* 'dummy-pmd' specific config. */
     if (!netdev_is_pmd(dev)) {
         goto exit;
     }
-    smap_add_format(args, "requested_rx_queues", "%d", netdev->requested_n_rxq);
-    smap_add_format(args, "configured_rx_queues", "%d", dev->n_rxq);
-    smap_add_format(args, "requested_tx_queues", "%d", netdev->requested_n_txq);
-    smap_add_format(args, "configured_tx_queues", "%d", dev->n_txq);
+
+    smap_add_format(args, "n_rxq", "%d", netdev->requested_n_rxq);
+    smap_add_format(args, "n_txq", "%d", netdev->requested_n_txq);
+    smap_add_format(args, "numa_id", "%d", netdev->requested_numa_id);
 
 exit:
     ovs_mutex_unlock(&netdev->mutex);
@@ -924,6 +943,14 @@ netdev_dummy_set_config(struct netdev *netdev_, const struct smap *args,
     netdev->ol_ip_csum = smap_get_bool(args, "ol_ip_csum", false);
     if (netdev->ol_ip_csum) {
         netdev_->ol_flags |= NETDEV_TX_OFFLOAD_IPV4_CKSUM;
+    }
+
+    if (userspace_tso_enabled()) {
+        netdev->ol_tso_segsz = smap_get_int(args, "ol_tso_segsz", 0);
+        if (netdev->ol_tso_segsz) {
+            netdev_->ol_flags |= (NETDEV_TX_OFFLOAD_TCP_TSO
+                                  | NETDEV_TX_OFFLOAD_TCP_CKSUM);
+        }
     }
 
     netdev_change_seq_changed(netdev_);
@@ -1108,6 +1135,13 @@ netdev_dummy_rxq_recv(struct netdev_rxq *rxq_, struct dp_packet_batch *batch,
         /* The netdev hardware sets the flag when the packet has good csum. */
         dp_packet_ol_set_ip_csum_good(packet);
     }
+
+    if (userspace_tso_enabled() && netdev->ol_tso_segsz) {
+        dp_packet_set_tso_segsz(packet, netdev->ol_tso_segsz);
+        dp_packet_hwol_set_tcp_seg(packet);
+        dp_packet_hwol_set_csum_tcp(packet);
+    }
+
     ovs_mutex_unlock(&netdev->mutex);
 
     dp_packet_batch_init_packet(batch, packet);
@@ -1163,6 +1197,12 @@ netdev_dummy_send(struct netdev *netdev, int qid,
     DP_PACKET_BATCH_FOR_EACH(i, packet, batch) {
         const void *buffer = dp_packet_data(packet);
         size_t size = dp_packet_size(packet);
+        bool is_tso;
+
+        ovs_mutex_lock(&dev->mutex);
+        is_tso = userspace_tso_enabled() && dev->ol_tso_segsz &&
+                 dp_packet_hwol_is_tso(packet);
+        ovs_mutex_unlock(&dev->mutex);
 
         if (!dp_packet_is_eth(packet)) {
             error = EPFNOSUPPORT;
@@ -1183,7 +1223,7 @@ netdev_dummy_send(struct netdev *netdev, int qid,
             if (eth->eth_type == htons(ETH_TYPE_VLAN)) {
                 max_size += VLAN_HEADER_LEN;
             }
-            if (size > max_size) {
+            if (size > max_size && !is_tso) {
                 error = EMSGSIZE;
                 break;
             }
@@ -1191,7 +1231,7 @@ netdev_dummy_send(struct netdev *netdev, int qid,
 
         if (dp_packet_hwol_tx_ip_csum(packet) &&
             !dp_packet_ip_checksum_good(packet)) {
-            dp_packet_ip_set_header_csum(packet);
+            dp_packet_ip_set_header_csum(packet, false);
             dp_packet_ol_set_ip_csum_good(packet);
         }
 
@@ -1758,7 +1798,7 @@ eth_from_flow_str(const char *s, size_t packet_size,
 
     packet = dp_packet_new(0);
     if (packet_size) {
-        flow_compose(packet, flow, NULL, 0);
+        flow_compose(packet, flow, NULL, 0, false);
         if (dp_packet_size(packet) < packet_size) {
             packet_expand(packet, flow, packet_size);
         } else if (dp_packet_size(packet) > packet_size){
@@ -1766,7 +1806,7 @@ eth_from_flow_str(const char *s, size_t packet_size,
             packet = NULL;
         }
     } else {
-        flow_compose(packet, flow, NULL, 64);
+        flow_compose(packet, flow, NULL, 64, false);
     }
 
     ofpbuf_uninit(&odp_key);
@@ -2045,11 +2085,20 @@ netdev_dummy_ip4addr(struct unixctl_conn *conn, int argc OVS_UNUSED,
 
     if (netdev && is_dummy_class(netdev->netdev_class)) {
         struct in_addr ip, mask;
+        struct in6_addr ip6;
+        uint32_t plen;
         char *error;
 
-        error = ip_parse_masked(argv[2], &ip.s_addr, &mask.s_addr);
+        error = ip_parse_cidr(argv[2], &ip.s_addr, &plen);
         if (!error) {
+            mask.s_addr = be32_prefix_mask(plen);
             netdev_dummy_add_in4(netdev, ip, mask);
+
+            /* Insert local route entry for the new address. */
+            in6_addr_set_mapped_ipv4(&ip6, ip.s_addr);
+            ovs_router_force_insert(0, &ip6, plen + 96, true, argv[1],
+                                    &in6addr_any, &ip6);
+
             unixctl_command_reply(conn, "OK");
         } else {
             unixctl_command_reply_error(conn, error);
@@ -2079,6 +2128,11 @@ netdev_dummy_ip6addr(struct unixctl_conn *conn, int argc OVS_UNUSED,
 
             mask = ipv6_create_mask(plen);
             netdev_dummy_add_in6(netdev, &ip6, &mask);
+
+            /* Insert local route entry for the new address. */
+            ovs_router_force_insert(0, &ip6, plen, true, argv[1],
+                                    &in6addr_any, &ip6);
+
             unixctl_command_reply(conn, "OK");
         } else {
             unixctl_command_reply_error(conn, error);

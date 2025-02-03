@@ -1,4 +1,5 @@
-/* Copyright 2020, Red Hat, Inc.
+/*
+ * Copyright (c) 2024 Canonical Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,16 +14,19 @@
  * limitations under the License.
  */
 
-#ifndef __CHECKER__
-#error "Use this header only with sparse.  It is not a correct implementation."
-#endif
+#ifndef JSON_H
+#define JSON_H 1
 
-/* sparse doesn't know about gcc atomic builtins. */
-#ifndef __ATOMIC_ACQUIRE
-#define __ATOMIC_ACQUIRE 0
-#define __atomic_load_n(p, memorder) *(p)
-#endif
+#include "openvswitch/json.h"
 
-/* Get actual <rte_trace_point.h> definitions for us to annotate and
- * build on. */
-#include_next <rte_trace_point.h>
+static inline void
+json_destroy_with_yield(struct json *json)
+{
+    if (json && !--json->count) {
+        json_destroy__(json, true);
+    }
+}
+
+struct json *json_serialized_object_create_with_yield(const struct json *);
+
+#endif /* JSON_H */

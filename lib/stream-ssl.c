@@ -32,6 +32,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "bitmap.h"
 #include "coverage.h"
 #include "openvswitch/dynamic-string.h"
 #include "entropy.h"
@@ -42,6 +43,7 @@
 #include "openvswitch/shash.h"
 #include "socket-util.h"
 #include "util.h"
+#include "sset.h"
 #include "stream-provider.h"
 #include "stream.h"
 #include "timeval.h"
@@ -64,7 +66,7 @@
 
 VLOG_DEFINE_THIS_MODULE(stream_ssl);
 
-/* Active SSL. */
+/* Active SSL/TLS. */
 
 enum ssl_state {
     STATE_TCP_CONNECTING,
@@ -162,8 +164,9 @@ struct ssl_config_file {
 static struct ssl_config_file private_key;
 static struct ssl_config_file certificate;
 static struct ssl_config_file ca_cert;
-static char *ssl_protocols = "TLSv1,TLSv1.1,TLSv1.2";
-static char *ssl_ciphers = "HIGH:!aNULL:!MD5";
+static char *ssl_protocols = "TLSv1.2+";
+static char *ssl_ciphers = "DEFAULT:@SECLEVEL=2";
+static char *ssl_ciphersuites = ""; /* Using default ones, unless specified. */
 
 /* Ordinarily, the SSL client and server verify each other's certificates using
  * a CA certificate.  Setting this to false disables this behavior.  (This is a
@@ -286,14 +289,12 @@ new_ssl_stream(char *name, char *server_name, int fd, enum session_type type,
     if (!verify_peer_cert || (bootstrap_ca_cert && type == CLIENT)) {
         SSL_set_verify(ssl, SSL_VERIFY_NONE, NULL);
     }
-#if OPENSSL_SUPPORTS_SNI
     if (server_name && !SSL_set_tlsext_host_name(ssl, server_name)) {
         VLOG_ERR("%s: failed to set server name indication (%s)",
                  server_name, ERR_error_string(ERR_get_error(), NULL));
         retval = ENOPROTOOPT;
         goto error;
     }
-#endif
 
     /* Create and return the ssl_stream. */
     sslv = xmalloc(sizeof *sslv);
@@ -499,14 +500,7 @@ get_peer_common_name(const struct ssl_stream *sslv)
         goto error;
     }
 
-    const char *cn;
-#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined (LIBRESSL_VERSION_NUMBER)
-    /* ASN1_STRING_data() is deprecated as of OpenSSL version 1.1 */
-    cn = (const char *)ASN1_STRING_data(cn_data);
-#else
-    cn = (const char *)ASN1_STRING_get0_data(cn_data);
- #endif
-    peer_name = xstrdup(cn);
+    peer_name = xstrdup((const char *) ASN1_STRING_get0_data(cn_data));
 
 error:
     X509_free(peer_cert);
@@ -567,16 +561,15 @@ ssl_connect(struct stream *stream)
              * certificate, but that's more trouble than it's worth.  These
              * connections will succeed the next time they retry, assuming that
              * they have a certificate against the correct CA.) */
-            VLOG_INFO("rejecting SSL connection during bootstrap race window");
+            VLOG_INFO(
+                "rejecting SSL/TLS connection during bootstrap race window");
             return EPROTO;
         } else {
-#if OPENSSL_SUPPORTS_SNI
             const char *servername = SSL_get_servername(
                 sslv->ssl, TLSEXT_NAMETYPE_host_name);
             if (servername) {
                 VLOG_DBG("connection indicated server name %s", servername);
             }
-#endif
 
             char *cn = get_peer_common_name(sslv);
 
@@ -671,7 +664,7 @@ interpret_ssl_error(const char *function, int ret, int error,
                              function, ovs_strerror(status));
                 return status;
             } else {
-                VLOG_WARN_RL(&rl, "%s: unexpected SSL connection close",
+                VLOG_WARN_RL(&rl, "%s: unexpected SSL/TLS connection close",
                              function);
                 return EPROTO;
             }
@@ -873,7 +866,7 @@ const struct stream_class ssl_stream_class = {
     ssl_wait,                   /* wait */
 };
 
-/* Passive SSL. */
+/* Passive SSL/TLS. */
 
 struct pssl_pstream
 {
@@ -1013,17 +1006,6 @@ ssl_init(void)
 static int
 do_ssl_init(void)
 {
-    SSL_METHOD *method;
-
-#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined (LIBRESSL_VERSION_NUMBER)
-#ifdef _WIN32
-    /* The following call is needed if we "#include <openssl/applink.c>". */
-    CRYPTO_malloc_init();
-#endif
-    SSL_library_init();
-    SSL_load_error_strings();
-#endif
-
     if (!RAND_status()) {
         /* We occasionally see OpenSSL fail to seed its random number generator
          * in heavily loaded hypervisors.  I suspect the following scenario:
@@ -1054,19 +1036,14 @@ do_ssl_init(void)
         RAND_seed(seed, sizeof seed);
     }
 
-    /* OpenSSL has a bunch of "connection methods": SSLv2_method(),
-     * SSLv3_method(), TLSv1_method(), SSLv23_method(), ...  Most of these
-     * support exactly one version of SSL, e.g. TLSv1_method() supports TLSv1
-     * only, not any earlier *or later* version.  The only exception is
-     * SSLv23_method(), which in fact supports *any* version of SSL and TLS.
-     * We don't want SSLv2 or SSLv3 support, so we turn it off below with
-     * SSL_CTX_set_options().
+    /* Using version-flexible "connection method".  Allowed versions will
+     * be restricted below.
      *
-     * The cast is needed to avoid a warning with newer versions of OpenSSL in
-     * which SSLv23_method() returns a "const" pointer. */
-    method = CONST_CAST(SSL_METHOD *, SSLv23_method());
+     * The context can be used for both client and server connections, so
+     * not using specific TLS_server_method() or TLS_client_method() here. */
+    const SSL_METHOD *method = TLS_method();
     if (method == NULL) {
-        VLOG_ERR("TLSv1_method: %s", ERR_error_string(ERR_get_error(), NULL));
+        VLOG_ERR("TLS_method: %s", ERR_error_string(ERR_get_error(), NULL));
         return ENOPROTOOPT;
     }
 
@@ -1076,11 +1053,13 @@ do_ssl_init(void)
         return ENOPROTOOPT;
     }
 
-    long options = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3;
 #ifdef SSL_OP_IGNORE_UNEXPECTED_EOF
-    options |= SSL_OP_IGNORE_UNEXPECTED_EOF;
+    SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);
 #endif
-    SSL_CTX_set_options(ctx, options);
+
+    /* Only allow TLSv1.2 or later. */
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, 0);
 
 #if OPENSSL_VERSION_NUMBER < 0x3000000fL
     SSL_CTX_set_tmp_dh_callback(ctx, tmp_dh_callback);
@@ -1092,7 +1071,7 @@ do_ssl_init(void)
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
                        NULL);
     SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
-    SSL_CTX_set_cipher_list(ctx, "HIGH:!aNULL:!MD5");
+    SSL_CTX_set_cipher_list(ctx, "DEFAULT:@SECLEVEL=2");
 
     return 0;
 }
@@ -1131,7 +1110,7 @@ tmp_dh_callback(SSL *ssl OVS_UNUSED, int is_export OVS_UNUSED, int keylength)
 }
 #endif
 
-/* Returns true if SSL is at least partially configured. */
+/* Returns true if SSL/TLS is at least partially configured. */
 bool
 stream_ssl_is_configured(void)
 {
@@ -1242,8 +1221,8 @@ stream_ssl_set_key_and_cert(const char *private_key_file,
     }
 }
 
-/* Sets SSL ciphers based on string input. Aborts with an error message
- * if 'arg' is invalid. */
+/* Sets SSL/TLS ciphers for TLSv1.2 and earlier based on string input.
+ * Aborts with an error message if 'arg' is not valid. */
 void
 stream_ssl_set_ciphers(const char *arg)
 {
@@ -1257,56 +1236,119 @@ stream_ssl_set_ciphers(const char *arg)
     ssl_ciphers = xstrdup(arg);
 }
 
-/* Set SSL protocols based on the string input. Aborts with an error message
- * if 'arg' is invalid. */
+/* Sets TLS ciphersuites for TLSv1.3 and later based on string input.
+ * Aborts with an error message if 'arg' is not valid. */
+void
+stream_ssl_set_ciphersuites(const char *arg)
+{
+    if (ssl_init() || !arg || !strcmp(ssl_ciphersuites, arg)) {
+        return;
+    }
+    if (SSL_CTX_set_ciphersuites(ctx, arg) == 0) {
+        VLOG_ERR("SSL_CTX_set_ciphersuites: %s",
+                 ERR_error_string(ERR_get_error(), NULL));
+    }
+    ssl_ciphersuites = xstrdup(arg);
+}
+
+/* Set SSL/TLS protocols based on the string input. Aborts with an error
+ * message if 'arg' is invalid. */
 void
 stream_ssl_set_protocols(const char *arg)
 {
-    if (ssl_init() || !arg || !strcmp(arg, ssl_protocols)){
+    if (ssl_init() || !arg || !strcmp(arg, ssl_protocols)) {
         return;
     }
 
-    /* Start with all the flags off and turn them on as requested. */
-#ifndef SSL_OP_NO_SSL_MASK
-    /* For old OpenSSL without this macro, this is the correct value.  */
-#define SSL_OP_NO_SSL_MASK (SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | \
-                            SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1 | \
-                            SSL_OP_NO_TLSv1_2)
-#endif
-    long protocol_flags = SSL_OP_NO_SSL_MASK;
+    struct sset set = SSET_INITIALIZER(&set);
+    struct {
+        const char *name;
+        int version;
+        bool deprecated;
+    } protocols[] = {
+        {"later",   0 /* any version */, false},
+        {"TLSv1",   TLS1_VERSION,        true },
+        {"TLSv1.1", TLS1_1_VERSION,      true },
+        {"TLSv1.2", TLS1_2_VERSION,      false},
+        {"TLSv1.3", TLS1_3_VERSION,      false},
+    };
+    char *dash = strchr(arg, '-');
+    bool or_later = false;
+    int len = strlen(arg);
 
-    char *s = xstrdup(arg);
-    char *save_ptr = NULL;
-    char *word = strtok_r(s, " ,\t", &save_ptr);
-    if (word == NULL) {
-        VLOG_ERR("SSL protocol settings invalid");
+    if (len && arg[len - 1] == '+') {
+        /* We only support full ranges, so more than one version or later "X+"
+         * doesn't make a lot of sense. */
+        sset_add_and_free(&set, xmemdup0(arg, len - 1));
+        or_later = true;
+    } else if (dash) {
+        /* Again, do not attempt to parse multiple ranges.  The range should
+         * always be a single "X-Y". */
+        sset_add_and_free(&set, xmemdup0(arg, dash - arg));
+        sset_add_and_free(&set, xstrdup(dash + 1));
+    } else {
+        /* Otherwise, it's a list that should not include ranges. */
+        sset_from_delimited_string(&set, arg, " ,\t");
+    }
+
+    if (sset_is_empty(&set)) {
+        VLOG_ERR("SSL/TLS protocol settings invalid");
         goto exit;
     }
-    while (word != NULL) {
-        long on_flag;
-        if (!strcasecmp(word, "TLSv1.2")){
-            on_flag = SSL_OP_NO_TLSv1_2;
-        } else if (!strcasecmp(word, "TLSv1.1")){
-            on_flag = SSL_OP_NO_TLSv1_1;
-        } else if (!strcasecmp(word, "TLSv1")){
-            on_flag = SSL_OP_NO_TLSv1;
-        } else {
-            VLOG_ERR("%s: SSL protocol not recognized", word);
-            goto exit;
+
+    size_t min_version = ARRAY_SIZE(protocols) + 1;
+    size_t max_version = 0;
+    unsigned long map = 0;
+
+    for (size_t i = 1; i < ARRAY_SIZE(protocols); i++) {
+        if (sset_contains(&set, protocols[i].name)) {
+            min_version = MIN(min_version, i);
+            max_version = MAX(max_version, i);
+            if (protocols[i].deprecated) {
+                VLOG_WARN("%s protocol is deprecated", protocols[i].name);
+            }
+            bitmap_set1(&map, i);
+            sset_find_and_delete(&set, protocols[i].name);
         }
-        /* Reverse the no flag and mask it out in the flags
-         * to turn on that protocol. */
-        protocol_flags &= ~on_flag;
-        word = strtok_r(NULL, " ,\t", &save_ptr);
-    };
+    }
 
-    /* Set the actual options. */
-    SSL_CTX_set_options(ctx, protocol_flags);
+    if (!sset_is_empty(&set)) {
+        const char *word;
 
+        SSET_FOR_EACH (word, &set) {
+            VLOG_ERR("%s: SSL/TLS protocol not recognized", word);
+        }
+        goto exit;
+    }
+
+    /* At this point we must have parsed at least one protocol. */
+    ovs_assert(min_version && min_version < ARRAY_SIZE(protocols));
+    ovs_assert(max_version && max_version < ARRAY_SIZE(protocols));
+    if (!or_later && !dash) {
+        for (size_t i = min_version + 1; i < max_version; i++) {
+            if (!bitmap_is_set(&map, i)) {
+                VLOG_WARN("SSL/TLS protocol %s"
+                          " is not configured, but will be enabled anyway.",
+                          protocols[i].name);
+            }
+        }
+    }
+
+    if (or_later) {
+        ovs_assert(min_version == max_version);
+        max_version = 0;
+    }
+
+    /* Set the actual versions. */
+    SSL_CTX_set_min_proto_version(ctx, protocols[min_version].version);
+    SSL_CTX_set_max_proto_version(ctx, protocols[max_version].version);
+    VLOG_DBG("Enabled protocol range: %s%s%s", protocols[min_version].name,
+                                               max_version ? " - " : " or ",
+                                               protocols[max_version].name);
     ssl_protocols = xstrdup(arg);
 
 exit:
-    free(s);
+    sset_destroy(&set);
 }
 
 /* Reads the X509 certificate or certificates in file 'file_name'.  On success,
@@ -1468,17 +1510,18 @@ stream_ssl_set_ca_cert_file__(const char *file_name,
 }
 
 /* Sets 'file_name' as the name of the file from which to read the CA
- * certificate used to verify the peer within SSL connections.  If 'bootstrap'
- * is false, the file must exist.  If 'bootstrap' is false, then the file is
- * read if it is exists; if it does not, then it will be created from the CA
- * certificate received from the peer on the first SSL connection. */
+ * certificate used to verify the peer within SSL/TLS connections.  If
+ * 'bootstrap' is false, the file must exist.  If 'bootstrap' is false, then
+ * the file is read if it is exists; if it does not, then it will be created
+ * from the CA certificate received from the peer on the first SSL/TLS
+ * connection. */
 void
 stream_ssl_set_ca_cert_file(const char *file_name, bool bootstrap)
 {
     stream_ssl_set_ca_cert_file__(file_name, bootstrap, false);
 }
 
-/* SSL protocol logging. */
+/* SSL/TLS protocol logging. */
 
 static const char *
 ssl_alert_level_to_string(uint8_t type)
